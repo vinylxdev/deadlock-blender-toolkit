@@ -81,8 +81,10 @@ def expected_pose(rig, reference, animated, mapping, runtime_roots=None):
     position_offsets=json.loads(rig.get('deadlock_retarget_contact_offsets','{}'))
     positions=position_roles(rig)
     expected=dict(animated)
-    original_names=set(json.loads(rig['deadlock_retarget_original_names']).values())
-    pending=[b for b in rig.data.bones if b.name in original_names]
+    # Export-only physics helpers also need a pose for the skinning palette.
+    # Native bones already have their animated pose; inherit the rest for all
+    # remaining bones, applying retarget rules only to mapped avatar bones.
+    pending=[b for b in rig.data.bones if b.name not in expected]
     while pending:
         for bone in pending[:]:
             if bone.parent and bone.parent.name not in expected: continue

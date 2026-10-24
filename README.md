@@ -32,7 +32,7 @@ On Windows, select `Source2Viewer-CLI.exe` and the SDK containing `resourcecompi
 3. Click **Refresh Heroes** and choose the hero to replace.
 4. Under **Preview & Retarget**, choose **Preserve avatar**, then click **Retarget Original Rig Preview**.
 5. Use **Preview Idle Pose** to inspect the result. Configure accessory chains under **Physics** and test them with **Preview Physics**.
-6. Under **Build & Export**, choose your texture resolution and **Keep native gun** setting, then click **Build Retargeted VPK**.
+6. Under **Build & Export**, choose your texture resolution and **Keep native gun** setting, click **Build Retargeted VPK**, and choose the VPK's location and filename in the save dialog.
 7. Import the resulting VPK into your mod manager.
 
 All avatar meshes must be bound to one armature and have accessible textures. Automatic material baking expects Principled BSDF materials. Builds run in a background Blender process; press **Esc** to cancel. Test the resulting mod in game.

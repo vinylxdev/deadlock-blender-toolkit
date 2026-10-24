@@ -140,7 +140,7 @@ def run(config):
             report['physics_validation']=validate_compiled_physics(compiled.read_bytes(),replacement,physics_nodes)
         progress('Validating compiled dependency closure and packaging VPK')
         files=addon.collect_compiled(game,compiled,replacement,retail,retail_staged)
-        vpk=output/f'{stem}_{key}.vpk'
+        vpk=Path(config['vpk_path']) if config.get('vpk_path') else output/f'{stem}_{key}.vpk'
         pack_vpk(files,vpk)
         report.update({'compiler_verified':True,'vpk':str(vpk),'packaged_files':sorted(files)})
         installed=None

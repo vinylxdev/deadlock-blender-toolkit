@@ -4,7 +4,7 @@ import time
 import bpy
 from mathutils import Matrix
 
-from .physics import KEY, export_chains, physics_rig
+from .physics import KEY, chains, export_chains, physics_rig
 from .physics_solver import ChainSolver
 
 _session = None
@@ -36,7 +36,10 @@ class Preview:
         self.clock = time.monotonic()
         self.busy = False
         bind = {bone.name: rig.matrix_world @ bone.matrix_local for bone in rig.data.bones}
-        self.solvers = [ChainSolver(node, bind, UNIT) for node in nodes]
+        settings = {entry['root']: entry for entry in chains(rig)}
+        self.solvers = [ChainSolver(node, bind, UNIT,
+                                   lock_twist=settings[node['root_bone']].get('lock_twist', False))
+                        for node in nodes]
         self.order = [bone.name for bone in sorted(rig.data.bones, key=lambda b: len(b.parent_recursive))
                       if bone.name in self.basis]
 

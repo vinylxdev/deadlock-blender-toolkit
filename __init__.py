@@ -414,16 +414,60 @@ class DL_OT_check(bpy.types.Operator):
             return report_error(self, settings, error)
 
 
-class DL_OT_export(bpy.types.Operator):
+class OutputDirectorySelector:
+    directory: StringProperty(name='Output folder', subtype='DIR_PATH', options={'SKIP_SAVE'})
+    filter_folder: BoolProperty(default=True, options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        settings = context.scene.deadlock_export
+        try:
+            default = settings.output_dir if settings.output_dir.strip() else str(Path.home() / 'DeadlockExports')
+            self.directory = str(local_path(default)) + os.sep
+            context.window_manager.fileselect_add(self)
+            return {'RUNNING_MODAL'}
+        except Exception as error:
+            return report_error(self, settings, error)
+
+    def draw(self, context):
+        self.layout.label(text="Files are grouped in the selected hero's subfolder")
+
+    def apply_output_directory(self, settings):
+        directory = local_path(self.directory or settings.output_dir)
+        if directory.exists() and not directory.is_dir():
+            raise ValueError('Choose an output folder, rather than a file')
+        settings.output_dir = str(directory)
+
+
+class DL_OT_export(bpy.types.Operator, ExportHelper, OutputDirectorySelector):
     bl_idname = "deadlock.export_source"
     bl_label = "Export Source FBX"
     bl_description = "Export the current model appearance and native rig; this is an authoring file, not a playable mod"
+    filename_ext = '.fbx'
+    filter_glob: StringProperty(default='*.fbx', options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        settings = context.scene.deadlock_export
+        try:
+            if not self.filepath:
+                default = settings.output_dir if settings.output_dir.strip() else str(Path.home() / 'DeadlockExports')
+                self.filepath = str(local_path(default) / 'deadlock_toolkit.fbx')
+            return ExportHelper.invoke(self, context, event)
+        except Exception as error:
+            return report_error(self, settings, error)
+
+    def draw(self, context):
+        self.layout.label(text='Writes the FBX and a matching JSON report')
 
     def execute(self, context):
         settings = context.scene.deadlock_export
         try:
             key, name, model = selected_hero(settings)
-            output = local_path(settings.output_dir) / key / "deadlock_toolkit.fbx"
+            if self.filepath:
+                output = local_path(bpy.path.ensure_ext(self.filepath, self.filename_ext))
+                settings.output_dir = str(output.parent)
+            else:
+                self.apply_output_directory(settings)
+                output = local_path(settings.output_dir) / key / "deadlock_toolkit.fbx"
             export_fbx(settings, output)
             _, meshes = source_objects(settings)
             materials = material_report(meshes)
@@ -600,6 +644,8 @@ class DL_OT_physics_chain(bpy.types.Operator):
                                     description='Torsion spring strength on longer chains: higher values resist twisting; this is not a hard angle limit')
     lock_root_rotation: BoolProperty(name='Lock root rotation',default=True,
                                     description='Keep the pinned root’s animated orientation instead of letting simulation roll it; descendants still bend')
+    lock_twist: BoolProperty(name='Lock twist (swing only)', default=False,
+                            description='Allow bending without simulated roll around the bone’s length (local Y). Game export uses native pitch/yaw jiggle bones; spring response can differ from preview')
     anchor_child_roots: BoolProperty(name='Anchor child roots',default=False,
                                     description='Keep each direct child attached in its animated pose; useful when one hair root contains several strands. Lower bones still simulate')
     stable_rotation_frames: BoolProperty(name='Stable rotation frames',default=False,
@@ -620,6 +666,7 @@ class DL_OT_physics_chain(bpy.types.Operator):
             for key in ('root','stiffness','damping','gravity'): setattr(self,key,entries[self.index][key])
             self.twist_resistance=entries[self.index].get('twist_resistance',0.2)
             self.lock_root_rotation=entries[self.index].get('lock_root_rotation',False)
+            self.lock_twist=entries[self.index].get('lock_twist',False)
             self.anchor_child_roots=entries[self.index].get('anchor_child_roots',False)
             self.stable_rotation_frames=entries[self.index].get('stable_rotation_frames',False)
         elif context.object and context.object.type=='ARMATURE' and context.object.data.bones.active:
@@ -635,6 +682,9 @@ class DL_OT_physics_chain(bpy.types.Operator):
         self.layout.prop(self,'damping')
         self.layout.prop(self,'gravity')
         self.layout.prop(self,'lock_root_rotation')
+        self.layout.prop(self,'lock_twist')
+        if self.lock_twist:
+            self.layout.label(text='Game export uses native jiggle bones', icon='INFO')
         self.layout.prop(self,'twist_resistance')
         self.layout.prop(self,'anchor_child_roots')
         self.layout.prop(self,'stable_rotation_frames')
@@ -646,7 +696,7 @@ class DL_OT_physics_chain(bpy.types.Operator):
             rig=bpy.data.objects.get(self.rig_name) if self.rig_name else physics_rig(context,settings)
             if rig is None: raise ValueError('Create Retarget Original Rig Preview first')
             entries=chains(rig)
-            entry={key:getattr(self,key) for key in ('root','stiffness','damping','gravity','twist_resistance','lock_root_rotation','anchor_child_roots','stable_rotation_frames')}
+            entry={key:getattr(self,key) for key in ('root','stiffness','damping','gravity','twist_resistance','lock_root_rotation','anchor_child_roots','stable_rotation_frames','lock_twist')}
             index=self.index
             if index<0: index=next((i for i,e in enumerate(entries) if e['root']==self.root),-1)
             if index>=len(entries): raise ValueError('Physics chain no longer exists')
@@ -747,12 +797,14 @@ class DL_OT_physics_load(bpy.types.Operator, ImportHelper):
         except Exception as error: return report_error(self,settings,error)
 
 
-class DL_OT_automatic(bpy.types.Operator):
+class DL_OT_automatic(bpy.types.Operator, ExportHelper, OutputDirectorySelector):
     bl_idname = "deadlock.automatic_conversion"
     bl_label = "Build Retargeted VPK"
     bl_description = "Build the original-rig retarget preview, bake materials and compile its runtime constraints and physics into a replacement VPK"
     compile: BoolProperty(default=True, options={'HIDDEN'})
     retarget: BoolProperty(default=True, options={'HIDDEN'})
+    filename_ext = '.vpk'
+    filter_glob: StringProperty(default='*.vpk', options={'HIDDEN'})
     _process = None
     _timer = None
     _log = None
@@ -761,9 +813,33 @@ class DL_OT_automatic(bpy.types.Operator):
     def poll(cls, context):
         return not context.window_manager.get('deadlock_build_running',False)
 
+    def invoke(self, context, event):
+        if not (self.compile and self.retarget):
+            return OutputDirectorySelector.invoke(self, context, event)
+        settings = context.scene.deadlock_export
+        try:
+            if not self.filepath:
+                default = settings.output_dir if settings.output_dir.strip() else str(Path.home() / 'DeadlockExports')
+                self.filepath = str(local_path(default) / f'deadlock_toolkit_retarget_{settings.hero}.vpk')
+            return ExportHelper.invoke(self, context, event)
+        except Exception as error:
+            return report_error(self, settings, error)
+
+    def draw(self, context):
+        if self.compile and self.retarget:
+            self.layout.label(text='Reports and logs go in a hero subfolder')
+        else:
+            OutputDirectorySelector.draw(self, context)
+
     def execute(self, context):
         settings=context.scene.deadlock_export
         try:
+            vpk_path = None
+            if self.compile and self.retarget and self.filepath:
+                vpk_path = local_path(bpy.path.ensure_ext(self.filepath, self.filename_ext))
+                settings.output_dir = str(vpk_path.parent)
+            else:
+                self.apply_output_directory(settings)
             from .conversion import semantic_mapping
             import uuid
             collection=settings.collection
@@ -797,6 +873,8 @@ class DL_OT_automatic(bpy.types.Operator):
             config.update({'collection':collection.name,'source_blend':collection.get('deadlock_source_blend',bpy.data.filepath),
                            'status_path':str(self._status_path),'compile':self.compile,'retarget':self.retarget,
                            'scene_unit_scale':context.scene.unit_settings.scale_length})
+            if vpk_path is not None:
+                config['vpk_path'] = str(vpk_path)
             (job/'job.json').write_text(json.dumps(config,indent=2),encoding='utf-8')
             settings.status='Saving an isolated snapshot for automatic conversion'
             from .physics_preview import stop
@@ -911,7 +989,7 @@ def collect_compiled(game_dir, main, replacement, retail, retail_staged=()):
     return files
 
 
-class DL_OT_build(bpy.types.Operator):
+class DL_OT_build(bpy.types.Operator, OutputDirectorySelector):
     bl_idname = "deadlock.build_mod"
     bl_label = "Export and Build VPK"
     bl_description = "Requires a matching hero rig, prepared ModelDoc template, material bindings and Source 2 compiler"
@@ -926,6 +1004,7 @@ class DL_OT_build(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.deadlock_export
         try:
+            self.apply_output_directory(settings)
             key, name, replacement = selected_hero(settings)
             compiler = local_path(settings.compiler)
             if not compiler.is_file():
@@ -1030,6 +1109,16 @@ class DL_OT_build(bpy.types.Operator):
         except Exception as error:
             self.finish(context, success=False)
             return report_error(self, settings, error)
+
+
+class DL_OT_copy_status(bpy.types.Operator):
+    bl_idname = "deadlock.copy_status"
+    bl_label = "Copy Status"
+    bl_description = "Copy the full status message to the clipboard"
+
+    def execute(self, context):
+        context.window_manager.clipboard = context.scene.deadlock_export.status
+        return {'FINISHED'}
 
 
 def status_lines(context, message):
@@ -1156,6 +1245,8 @@ class DL_PT_export(bpy.types.Panel):
                     edit.index = index
                     remove = row.operator('deadlock.remove_physics_chain', text='', icon='X')
                     remove.index = index
+                if any(entry.get('lock_twist') for entry in entries):
+                    body.label(text='Twist lock exports native jiggle bones', icon='INFO')
                 body.operator('deadlock.physics_chain', icon='ADD').index = -1
                 row = body.row(align=True)
                 row.operator('deadlock.save_physics_preset', text='Save Preset', icon='FILE_TICK')
@@ -1199,7 +1290,9 @@ class DL_PT_export(bpy.types.Panel):
                 prepared.label(text='Requires hero rig preparation and Source 2 tools')
 
         layout.separator()
-        layout.label(text='Status', icon='INFO')
+        header = layout.row(align=True)
+        header.label(text='Status', icon='INFO')
+        header.operator('deadlock.copy_status', text='Copy', icon='COPYDOWN')
         status = layout.box()
         for line in status_lines(context, settings.status):
             status.label(text=line)
@@ -1223,7 +1316,7 @@ def find_game():
 _classes = (DL_Material, DL_Settings, DL_OT_refresh, DL_OT_reference, DL_OT_check,
             DL_OT_export, DL_OT_materials, DL_OT_retarget_preview, DL_OT_fit_retarget_legs, DL_OT_preserve_retarget_proportions, DL_OT_idle_preview,
             DL_OT_physics_preview, DL_OT_physics_chain, DL_OT_physics_remove, DL_OT_physics_save, DL_OT_physics_load,
-            DL_OT_automatic, DL_OT_build, DL_PT_export)
+            DL_OT_automatic, DL_OT_build, DL_OT_copy_status, DL_PT_export)
 
 
 def initialize_settings():

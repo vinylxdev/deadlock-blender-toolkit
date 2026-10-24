@@ -54,7 +54,7 @@ def validated_entries(entries):
             if type(value) not in (int,float) or not math.isfinite(value) or not 0<=value<=1:
                 raise ValueError(f'Invalid physics twist_resistance for {entry["root"]}')
             normalized['twist_resistance']=value
-        for key in ('lock_root_rotation','anchor_child_roots','stable_rotation_frames'):
+        for key in ('lock_root_rotation','anchor_child_roots','stable_rotation_frames','lock_twist'):
             if key in entry:
                 if type(entry[key]) is not bool:
                     raise ValueError(f'Invalid physics {key} for {entry["root"]}')
@@ -118,11 +118,14 @@ def export_chains(rig, names):
     for entry in validate_chains(rig):
         members = chain_bones(rig, entry['root'])
         rows = []
+        lengths, parents = {}, {}
         for bone in members:
             anchored=bone==members[0] or (entry.get('anchor_child_roots',False) and bone.parent==members[0])
             length = ((rig.matrix_world @ bone.tail_local) - (rig.matrix_world @ bone.head_local)).length / UNIT
             if length < 1e-4:
                 raise ValueError(f'Physics bone has no usable length: {bone.name}')
+            lengths[names[bone.name]] = length
+            parents[names[bone.name]] = names[bone.parent.name] if bone.parent else ''
             rows.append({'joint_name': names[bone.name],
                          'joint_parent': names[bone.parent.name] if bone != members[0] else '',
                          'simulate': not anchored,
@@ -149,9 +152,13 @@ def export_chains(rig, names):
                  for i, (key, value) in enumerate(defaults.items())}
         # ModelDoc treats ':' in a node name as a path qualifier and silently
         # drops the chain. Export names are already safe, unique identifiers.
-        result.append({'_class': 'ClothChain', 'name': 'avatar_physics_' + names[entry['root']],
-                       'root_bone': names[entry['root']],
-                       'chain': {'version': 2, 'joints': rows, 'attrs': attrs, 'selection': []}})
+        node = {'_class': 'ClothChain', 'name': 'avatar_physics_' + names[entry['root']],
+                'root_bone': names[entry['root']],
+                'chain': {'version': 2, 'joints': rows, 'attrs': attrs, 'selection': []}}
+        if entry.get('lock_twist') and any(row['allow_rotation'] for row in rows):
+            from .physics_swing import export_swing
+            node['_swing_only'] = export_swing(rows, lengths, parents, entry, UNIT)
+        result.append(node)
     return result
 
 
@@ -165,32 +172,43 @@ def append_physics_modeldoc(document, nodes):
         if isinstance(value, list):
             return '[ ' + ', '.join(kv(child) for child in value) + ' ]'
         return json.dumps(value, allow_nan=False)
-    # A single Softbody contains native and avatar chains, when the hero has one.
-    spans = [(a, b) for a, b, cls in class_spans(document) if cls == 'Softbody']
-    if len(spans) > 1:
-        raise ValueError('Multiple native Softbody nodes require manual ModelDoc preparation')
-    if spans:
-        start, end = spans[0]
-        fragment = document[start:end]
+    def append_list(document, node_class, children, defaults=()):
+        # Extend singleton lists so native hero physics and jiggles survive.
+        spans = [(a, b) for a, b, cls in class_spans(document) if cls == node_class]
+        if len(spans) > 1:
+            raise ValueError(f'Multiple native {node_class} nodes require manual ModelDoc preparation')
         import re
-        children = re.search(r'\bchildren\s*=\s*\[', fragment)
-        if children is None:
-            raise ValueError('Native Softbody has no children list')
-        offset = start + children.end()
-        addition = ', '.join(kv(node) for node in nodes) + ', '
-    else:
-        import re
-        root = re.search(r'\brootNode\s*=\s*\{', document)
-        if root is None:
-            raise ValueError('ModelDoc root node is missing')
-        children = re.search(r'\bchildren\s*=\s*\[', document[root.end():])
-        if children is None:
-            raise ValueError('ModelDoc root children are missing')
-        offset = root.end() + children.end()
-        params = {'_class': 'ClothParams', 'new_style': True, 'unitless_damping': True,
-                  'default_gravity_scale': 1.0, 'default_vel_air_drag': 0.1, 'extra_iterations': 2}
-        addition = kv({'_class': 'Softbody', 'children': [params] + nodes}) + ', '
-    return document[:offset] + addition + document[offset:]
+        if spans:
+            start, end = spans[0]
+            match = re.search(r'\bchildren\s*=\s*\[', document[start:end])
+            if match is None:
+                raise ValueError(f'Native {node_class} has no children list')
+            offset = start + match.end()
+            addition = ', '.join(kv(node) for node in children) + ', '
+        else:
+            root = re.search(r'\brootNode\s*=\s*\{', document)
+            if root is None:
+                raise ValueError('ModelDoc root node is missing')
+            match = re.search(r'\bchildren\s*=\s*\[', document[root.end():])
+            if match is None:
+                raise ValueError('ModelDoc root children are missing')
+            offset = root.end() + match.end()
+            addition = kv({'_class': node_class, 'children': list(defaults) + children}) + ', '
+        return document[:offset] + addition + document[offset:]
+
+    cloth, jiggles = [], []
+    for node in nodes:
+        if '_swing_only' in node:
+            cloth.extend(node['_swing_only']['cloth'])
+            jiggles.extend(node['_swing_only']['jigglebones'])
+        else:
+            cloth.append(node)
+    params = {'_class': 'ClothParams', 'new_style': True, 'unitless_damping': True,
+              'default_gravity_scale': 1.0, 'default_vel_air_drag': 0.1, 'extra_iterations': 2}
+    document = append_list(document, 'Softbody', cloth, [params])
+    if jiggles:
+        document = append_list(document, 'JiggleBoneList', jiggles)
+    return document
 
 
 def validate_compiled_physics(compiled, path, nodes):
@@ -202,7 +220,7 @@ def validate_compiled_physics(compiled, path, nodes):
     resource = read_resource(compiled, path, model=True)
     phys = resource.get_block(None, block_name='PHYS')
     fe = phys.get('m_pFeModel') if phys else None
-    if not fe or int(fe['m_nNodeCount']) <= int(fe['m_nStaticNodes']):
+    if not fe or (int(fe['m_nNodeCount']) <= int(fe['m_nStaticNodes']) and not fe.get('m_JiggleBones')):
         raise ValueError('Compiler did not produce dynamic physics nodes')
     names = [str(n) for n in fe['m_CtrlName']]
     static = int(fe['m_nStaticNodes'])
@@ -210,7 +228,19 @@ def validate_compiled_physics(compiled, path, nodes):
     rest = bone_matrices(resource.get_bones())
     maximum_rest_error = 0.0
     checked = []
+    def check_rest(name):
+        nonlocal maximum_rest_error
+        pose = fe['m_InitPose'][names.index(name)]
+        position_error = (Vector(pose[:3]) * UNIT - rest[name].translation).length
+        rotation = Quaternion((float(pose[7]), float(pose[4]), float(pose[5]), float(pose[6])))
+        if position_error > 0.0002 or abs(rotation.dot(rest[name].to_quaternion())) < 0.99999:
+            raise ValueError(f'Physics rest pose differs from the original bone: {name}')
+        maximum_rest_error = max(maximum_rest_error, position_error)
     for node in nodes:
+        if '_swing_only' in node:
+            from .physics_swing import validate_swing
+            checked.append(validate_swing(fe, node, skeleton, check_rest))
+            continue
         rows = node['chain']['joints']
         root = node['root_bone']
         if root not in names or names.index(root) >= static:
@@ -233,12 +263,7 @@ def validate_compiled_physics(compiled, path, nodes):
                 proxies=sum(n.startswith(prefix) and i>=static for i,n in enumerate(names))
                 if proxies<row['extrude_sides']:
                     raise ValueError(f'Physics rotation frame is missing support nodes: {name}')
-            pose = fe['m_InitPose'][names.index(name)]
-            position_error = (Vector(pose[:3]) * UNIT - rest[name].translation).length
-            rotation = Quaternion((float(pose[7]), float(pose[4]), float(pose[5]), float(pose[6])))
-            if position_error > 0.0002 or abs(rotation.dot(rest[name].to_quaternion())) < 0.99999:
-                raise ValueError(f'Physics rest pose differs from the original bone: {name}')
-            maximum_rest_error = max(maximum_rest_error, position_error)
+            check_rest(name)
         for row in rows:
             if row['end_effector'] > 0:
                 prefix = '$cc' + row['joint_name'] + '_'

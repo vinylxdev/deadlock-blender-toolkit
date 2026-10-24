@@ -260,12 +260,31 @@ def validate_compiled_materials(game_dir, baked_materials):
 
 def validate_compiled_geometry(compiled, path, collection):
     """Compare the compiler's vertex positions with the actual converted avatar."""
+    from types import SimpleNamespace
+    import bpy
     import numpy as np
     from mathutils.kdtree import KDTree
     from SourceIO.library.source2.blocks.vertex_index_buffer.vertex_buffer import VertexBuffer
-    from . import read_resource, UNIT
-    expected = [obj.matrix_world @ vertex.co for obj in collection.objects if obj.type == 'MESH'
-                for vertex in obj.data.vertices]
+    from . import read_resource, source_objects, UNIT
+    rig, meshes = source_objects(SimpleNamespace(collection=collection))
+    previous_pose = rig.data.pose_position
+    expected = []
+    try:
+        # Match export_fbx: bake the selected shape keys and modifiers in rest
+        # pose, using the same render-enabled meshes (including child collections).
+        rig.data.pose_position = 'REST'
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        for obj in meshes:
+            evaluated = obj.evaluated_get(depsgraph)
+            mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+            try:
+                expected.extend(obj.matrix_world @ vertex.co for vertex in mesh.vertices)
+            finally:
+                evaluated.to_mesh_clear()
+    finally:
+        rig.data.pose_position = previous_pose
+        bpy.context.view_layer.update()
     resource = read_resource(compiled, path, model=True)
     control = resource.get_block(None, block_name='CTRL')
     mesh = next((row for row in control['embedded_meshes'] if row.get('m_Name') in ('deadlock_toolkit', 'vinylrex')), None)

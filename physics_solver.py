@@ -9,11 +9,28 @@ import math
 import numpy as np
 
 
+def swing_only(reference, simulated):
+    """Aim local +Y with the shortest bend, preserving the reference's twist."""
+    direction = reference.T @ simulated[:, 1]
+    sine = np.linalg.norm(direction[[0, 2]])
+    cosine = np.clip(direction[1], -1, 1)
+    if sine < 1e-12:
+        # A reversed direction has no unique bend axis. Local X gives a
+        # deterministic half-turn with no Y twist and no division by zero.
+        bend = np.eye(3) if cosine >= 0 else np.diag((1, -1, -1))
+    else:
+        x, z = direction[2] / sine, -direction[0] / sine
+        cross = np.array(((0, -z, 0), (z, 0, -x), (0, x, 0)))
+        bend = np.eye(3) + sine * cross + (1 - cosine) * cross @ cross
+    return reference @ bend
+
+
 class ChainSolver:
     STEP = 1 / 120
     GRAVITY = 9.80665
 
-    def __init__(self, node, bind, unit):
+    def __init__(self, node, bind, unit, *, lock_twist=False):
+        self.lock_twist = lock_twist
         self.rows = node['chain']['joints']
         defaults = {key: attr['default'] for key, attr in node['chain']['attrs'].items()}
         self.rows = [dict(defaults, **row) for row in self.rows]
@@ -177,7 +194,18 @@ class ChainSolver:
             rotation = vt.T @ np.diag((1, 1, np.linalg.det(vt.T @ u.T))) @ u.T
             matrix = self.bind[name].copy()
             scale = np.linalg.norm(np.asarray(goals[name])[:3, :3], axis=0)
-            matrix[:3, :3] = rotation @ (matrix[:3, :3] / np.linalg.norm(matrix[:3, :3], axis=0)) * scale
+            orientation = rotation @ (matrix[:3, :3] / np.linalg.norm(matrix[:3, :3], axis=0))
+            if self.lock_twist:
+                reference = np.asarray(goals[name])[:3, :3] / scale
+                parent = row['joint_parent']
+                if parent in result:
+                    parent_goal = np.asarray(goals[parent])[:3, :3]
+                    parent_goal = parent_goal / np.linalg.norm(parent_goal, axis=0)
+                    parent_pose = result[parent][:3, :3]
+                    parent_pose = parent_pose / np.linalg.norm(parent_pose, axis=0)
+                    reference = parent_pose @ parent_goal.T @ reference
+                orientation = swing_only(reference, orientation)
+            matrix[:3, :3] = orientation * scale
             matrix[:3, 3] = self.position[indices[0]]
             result[name] = matrix
         return result

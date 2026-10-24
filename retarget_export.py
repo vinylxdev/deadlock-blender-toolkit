@@ -195,6 +195,8 @@ def prepare_retarget_export(settings):
             if bone.parent: rig.data.edit_bones[bone.name].parent = rig.data.edit_bones[bone.parent]
         for name, parent in parents.items():
             if parent is None: rig.data.edit_bones[names[name]].parent = rig.data.edit_bones[root]
+        from .physics_swing import add_swing_helpers
+        swing_helpers = add_swing_helpers(rig.data.edit_bones, physics_nodes, root)
         bpy.ops.object.mode_set(mode='OBJECT')
         for original in meshes:
             obj = original.copy(); obj.data = original.data.copy(); obj.animation_data_clear()
@@ -222,6 +224,9 @@ def prepare_retarget_export(settings):
     skeleton = {b.name: {'parent': b.parent, 'matrix': unit_matrix(reference[b.name])} for b in native_bones}
     skeleton.update({names[n]: {'parent': names[p] if p else root, 'matrix': matrix} for n, matrix in rest.items()
                      for p in [parents[n]]})
+    skeleton.update({name: {'parent': rig.data.bones[name].parent.name,
+                            'matrix': unit_matrix(rig.matrix_world @ rig.data.bones[name].matrix_local)}
+                     for name in swing_helpers})
     report = {'hero': selected_hero(settings)[1], 'method': 'Original rig runtime retargeting',
               'source_bones': len(source.data.bones), 'native_bones': len(native_bones),
               'export_bones': len(skeleton), 'runtime_constraints': len(constraints),
