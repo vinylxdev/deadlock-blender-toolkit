@@ -79,6 +79,11 @@ class ChainSolver:
                 frame(row, by_name[row['joint_name']], tip=True)
         self.offsets = np.array(offsets)
         self.owners = owners
+        self.names = [row['joint_name'] for row in self.rows]
+        self.name_indices = {name: index for index, name in enumerate(self.names)}
+        self.owner_indices = np.array([self.name_indices[name] for name in owners])
+        bind_frames = np.array([self.bind[name] for name in self.names])
+        self.bind_rotations = bind_frames[:, :3, :3] / np.linalg.norm(bind_frames[:, :3, :3], axis=1)[:, None, :]
         self.position = np.array(points)
         self.velocity = np.zeros_like(self.position)
         self.weights = np.array(weights)
@@ -88,6 +93,23 @@ class ChainSolver:
         self.damping = np.array([settings[name]['goal_damping'] for name in owners])[:, None]
         self.gravity = np.array([settings[name]['gravity_z'] for name in owners])[:, None]
         self.drag = np.array([settings[name]['drag'] for name in owners])[:, None]
+        # Authored settings are immutable for this solver's lifetime. Editing a
+        # chain recreates it, so these fixed-step coefficients need computing once.
+        self.spring = 3600 * self.strength / np.maximum(0.001, 1 - self.strength)
+        self.spring_damping = 2 * np.sqrt(self.spring) * self.damping / np.maximum(0.05, 1 - self.damping)
+        self.air_drag = np.power(1 - self.drag, 60 * self.STEP)
+        self.denominator = 1 + self.STEP * self.spring_damping + self.STEP * self.STEP * self.spring
+        self.limit_radius = np.array([settings[name].get('stray_radius', 0.0) * unit for name in owners])[:, None]
+        self.limit_strength = np.array([1.0 - settings[name].get('stray_radius_stretchiness', 0.0)
+                                        for name in owners])[:, None]
+        self.limited = np.flatnonzero((self.limit_radius[:, 0] > 0) &
+                                     (self.limit_strength[:, 0] > 0) & ~self.fixed)
+        self.colliding = np.array([i for i, name in enumerate(owners)
+                                   if settings[name].get('vertex_map') == 'deadlock_auto_body_collision'
+                                   and settings[name]['simulate'] and not self.fixed[i]], dtype=int)
+        self.collision_thickness = np.array([settings[owners[i]].get('collision_radius', 0) * unit
+                                             for i in self.colliding])
+        self.capsules = np.empty((0, 7))
         self.iterations = 1 + max(row['extra_iterations'] for row in self.rows)
         # Color the graph so vectorized projection never writes an endpoint twice.
         groups = []
@@ -102,17 +124,31 @@ class ChainSolver:
                 groups.append((occupied, group))
             occupied.update((a, b))
             group.append((a, b, np.linalg.norm(self.position[b] - self.position[a]), strength, unilateral))
-        self.groups = [np.array(group) for _, group in groups]
+        self.groups = []
+        for _, entries in groups:
+            group = np.array(entries)
+            a, b = group[:, 0].astype(int), group[:, 1].astype(int)
+            self.groups.append((a, b, group[:, 2], group[:, 3], group[:, 4].astype(bool),
+                                self.weights[a] + self.weights[b], self.weights[a, None], self.weights[b, None]))
+        # The fitting topology and bind offsets never change during preview.
+        for frame in self.frames:
+            if frame['tip']:
+                continue
+            neighbors = [other for other in self.frames if other['parent'] is frame]
+            if frame['parent']:
+                neighbors.append(frame['parent'])
+            indices = list(frame['indices']) + [other['indices'][0] for other in neighbors]
+            frame['fit_indices'] = np.array(indices)
+            reference = self.position[indices]
+            frame['fit_reference'] = reference - reference[0]
         self.goals = self.position.copy()
         self.accumulator = 0.0
 
     def targets(self, matrices):
-        result = []
-        for owner, offset in zip(self.owners, self.offsets):
-            matrix = np.asarray(matrices[owner])
-            rotation = matrix[:3, :3] / np.linalg.norm(matrix[:3, :3], axis=0)
-            result.append(matrix[:3, 3] + rotation @ offset)
-        return np.array(result)
+        frames = np.asarray([matrices[name] for name in self.names], dtype=float)
+        rotations = frames[:, :3, :3] / np.linalg.norm(frames[:, :3, :3], axis=1)[:, None, :]
+        return (frames[self.owner_indices, :3, 3] +
+                (rotations[self.owner_indices] @ self.offsets[:, :, None])[:, :, 0])
 
     def reset(self, matrices):
         self.goals = self.targets(matrices)
@@ -120,7 +156,8 @@ class ChainSolver:
         self.velocity.fill(0)
         self.accumulator = 0.0
 
-    def advance(self, matrices, seconds):
+    def advance(self, matrices, seconds, *, colliders=()):
+        self.capsules = np.asarray(colliders, dtype=float).reshape(-1, 7)
         target = self.targets(matrices)
         if seconds <= 0 or seconds > 0.25:
             self.reset(matrices)
@@ -135,6 +172,12 @@ class ChainSolver:
         self.accumulator = max(0.0, elapsed - count * self.STEP)
         self.goals = target
         self.position[self.fixed] = target[self.fixed]
+        # Also enforce hard bounds against the displayed animation pose when
+        # a frame ends between simulation steps. Soft limits stay on fixed steps.
+        self._project_limits(target, hard_only=True)
+        if len(self.capsules) and len(self.colliding):
+            self._project_collisions()
+            self._project_limits(target, hard_only=True)
         if not np.isfinite(self.position).all():
             raise ValueError('Physics preview became unstable; reset the preview')
 
@@ -143,69 +186,75 @@ class ChainSolver:
         previous = self.position.copy()
         # Implicit goal spring: damping affects attraction, not free motion when
         # strength is zero. Air drag remains independent, as in ModelDoc.
-        spring = 3600 * self.strength / np.maximum(0.001, 1 - self.strength)
-        damping = 2 * np.sqrt(spring) * self.damping / np.maximum(0.05, 1 - self.damping)
-        self.velocity *= np.power(1 - self.drag, 60 * dt)
+        self.velocity *= self.air_drag
         acceleration = np.zeros_like(self.position)
         acceleration[:, 2:3] = -self.GRAVITY * self.gravity
-        self.velocity = (self.velocity + dt * (acceleration + spring * (goal - self.position))) / (
-            1 + dt * damping + dt * dt * spring)
+        self.velocity = (self.velocity + dt * (acceleration + self.spring * (goal - self.position))) / self.denominator
         self.position += dt * self.velocity
         self.position[self.fixed] = goal[self.fixed]
         for _ in range(self.iterations):
-            for group in self.groups:
-                a, b = group[:, 0].astype(int), group[:, 1].astype(int)
+            for a, b, rest, strength, unilateral, total, weight_a, weight_b in self.groups:
                 delta = self.position[b] - self.position[a]
                 length = np.linalg.norm(delta, axis=1)
-                error = length - group[:, 2]
+                error = length - rest
                 # Source bend/torsion springs bound maximum bind distance;
                 # they do not force a curved accessory to straighten out.
-                error = np.where(group[:, 4] != 0, np.maximum(0, error), error)
-                total = self.weights[a] + self.weights[b]
-                correction = delta * (error * group[:, 3] / (np.maximum(length, 1e-12) * total))[:, None]
-                self.position[a] += correction * self.weights[a, None]
-                self.position[b] -= correction * self.weights[b, None]
+                error = np.where(unilateral, np.maximum(0, error), error)
+                correction = delta * (error * strength / (np.maximum(length, 1e-12) * total))[:, None]
+                self.position[a] += correction * weight_a
+                self.position[b] -= correction * weight_b
+            self._project_limits(goal)
+            if len(self.capsules) and len(self.colliding):
+                self._project_collisions()
+                self._project_limits(goal, hard_only=True)
         self.velocity = (self.position - previous) / dt
         self.velocity[self.fixed] = 0
 
+    def _project_collisions(self):
+        from .physics_collision import project_capsules
+        project_capsules(self.position, self.colliding, self.collision_thickness, self.capsules)
+
+    def _project_limits(self, goal, *, hard_only=False):
+        indices = self.limited
+        if hard_only:
+            indices = indices[self.limit_strength[indices, 0] >= 1.0]
+        if not len(indices):
+            return
+        delta = self.position[indices] - goal[indices]
+        distance = np.linalg.norm(delta, axis=1, keepdims=True)
+        excess = np.maximum(0.0, 1.0 - self.limit_radius[indices] / np.maximum(distance, 1e-12))
+        self.position[indices] -= delta * excess * self.limit_strength[indices]
+
     def matrices(self, goals):
         """Fit bone orientation to support points and neighboring joint centers."""
-        result = {}
+        goal_frames = np.asarray([goals[name] for name in self.names], dtype=float)
+        scales = np.linalg.norm(goal_frames[:, :3, :3], axis=1)
+        goal_rotations = goal_frames[:, :3, :3] / scales[:, None, :]
+        result, orientations = {}, {}
         for frame in self.frames:
             if frame['tip']:
                 continue
-            row, indices = frame['row'], list(frame['indices'])
+            row, indices = frame['row'], frame['fit_indices']
             name = row['joint_name']
+            index = self.name_indices[name]
             if not row['simulate'] and not row['allow_rotation']:
-                result[name] = np.array(goals[name])
+                result[name] = goal_frames[index].copy()
+                orientations[name] = goal_rotations[index]
                 continue
-            neighbors = [f for f in self.frames if f['parent'] is frame]
-            if frame['parent']:
-                neighbors.append(frame['parent'])
-            indices.extend(f['indices'][0] for f in neighbors)
-            reference = np.array([self.bind[self.owners[i]][:3, 3] +
-                                  (self.bind[self.owners[i]][:3, :3] /
-                                   np.linalg.norm(self.bind[self.owners[i]][:3, :3], axis=0)) @ self.offsets[i]
-                                  for i in indices])
             actual = self.position[indices]
-            reference -= reference[0]
             actual = actual - actual[0]
-            u, _, vt = np.linalg.svd(reference.T @ actual)
+            u, _, vt = np.linalg.svd(frame['fit_reference'].T @ actual)
             rotation = vt.T @ np.diag((1, 1, np.linalg.det(vt.T @ u.T))) @ u.T
             matrix = self.bind[name].copy()
-            scale = np.linalg.norm(np.asarray(goals[name])[:3, :3], axis=0)
-            orientation = rotation @ (matrix[:3, :3] / np.linalg.norm(matrix[:3, :3], axis=0))
+            orientation = rotation @ self.bind_rotations[index]
             if self.lock_twist:
-                reference = np.asarray(goals[name])[:3, :3] / scale
+                reference = goal_rotations[index]
                 parent = row['joint_parent']
                 if parent in result:
-                    parent_goal = np.asarray(goals[parent])[:3, :3]
-                    parent_goal = parent_goal / np.linalg.norm(parent_goal, axis=0)
-                    parent_pose = result[parent][:3, :3]
-                    parent_pose = parent_pose / np.linalg.norm(parent_pose, axis=0)
-                    reference = parent_pose @ parent_goal.T @ reference
+                    reference = orientations[parent] @ goal_rotations[self.name_indices[parent]].T @ reference
                 orientation = swing_only(reference, orientation)
-            matrix[:3, :3] = orientation * scale
+            orientations[name] = orientation
+            matrix[:3, :3] = orientation * scales[index]
             matrix[:3, 3] = self.position[indices[0]]
             result[name] = matrix
         return result

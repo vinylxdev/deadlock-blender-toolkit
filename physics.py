@@ -5,6 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from .physics_curve import CURVE_SETTINGS, SETTINGS, validated_curve
+
 KEY = 'deadlock_physics_chains'
 PRESET_FORMAT = 'deadlock_physics_chains'
 PRESET_VERSION = 1
@@ -49,16 +51,30 @@ def validated_entries(entries):
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= maximum:
                 raise ValueError(f'Invalid physics {key} for {entry["root"]}')
         normalized={key:entry[key] for key in ('root','stiffness','damping','gravity')}
+        for key in CURVE_SETTINGS:
+            if key + '_curve' in entry:
+                normalized[key + '_curve'] = validated_curve(entry[key + '_curve'])
+        for key, maximum in (('motion_limit', None), ('motion_limit_strength', 1)):
+            if key in entry:
+                value = entry[key]
+                if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                        or (maximum is not None and value > maximum)):
+                    raise ValueError(f'Invalid physics {key} for {entry["root"]}')
+                normalized[key] = value
         if 'twist_resistance' in entry:
             value=entry['twist_resistance']
             if type(value) not in (int,float) or not math.isfinite(value) or not 0<=value<=1:
                 raise ValueError(f'Invalid physics twist_resistance for {entry["root"]}')
             normalized['twist_resistance']=value
-        for key in ('lock_root_rotation','anchor_child_roots','stable_rotation_frames','lock_twist'):
+        for key in ('lock_root_rotation','anchor_child_roots','stable_rotation_frames','lock_twist','use_motion_limits','auto_collision'):
             if key in entry:
                 if type(entry[key]) is not bool:
                     raise ValueError(f'Invalid physics {key} for {entry["root"]}')
                 normalized[key]=entry[key]
+        if normalized.get('use_motion_limits') and normalized.get('lock_twist'):
+            raise ValueError('Motion limits require cloth simulation; turn off Lock twist for ' + entry['root'])
+        if normalized.get('auto_collision') and normalized.get('lock_twist'):
+            raise ValueError('Automatic body collisions require cloth simulation; turn off Lock twist for ' + entry['root'])
         result.append(normalized)
     return result
 
@@ -117,6 +133,35 @@ def export_chains(rig, names):
     result = []
     for entry in validate_chains(rig):
         members = chain_bones(rig, entry['root'])
+        values, positions = {}, None
+        settings = dict(SETTINGS)
+        if entry.get('use_motion_limits'):
+            settings.update(motion_limit=('stray_radius', 0.01),
+                            motion_limit_strength=('stray_radius_stretchiness', 1.0))
+        for key, (field, default) in settings.items():
+            base = float(entry.get(key, default))
+            values[field] = {bone.name: base for bone in members}
+            curve = entry.get(key + '_curve')
+            if curve and curve['enabled']:
+                from .physics_curve import chain_positions, multipliers
+                if positions is None:
+                    positions = chain_positions(members, rig.matrix_world)
+                scales = multipliers(curve, [positions[bone.name] for bone in members])
+                values[field] = {bone.name: base * scale for bone, scale in zip(members, scales)}
+        if entry.get('use_motion_limits'):
+            for bone in members:
+                radius = values['stray_radius'][bone.name]
+                strength = values['stray_radius_stretchiness'][bone.name]
+                # Source 2 treats a zero radius or full stretchiness as no
+                # constraint. Distances in presets and Blender are in meters.
+                active = radius > 0 and strength > 0
+                values['stray_radius'][bone.name] = radius / UNIT if active else 0.0
+                values['stray_radius_stretchiness'][bone.name] = 1.0 - strength if active else 0.0
+        if entry.get('auto_collision'):
+            from .physics_collision import VERTEX_MAP
+            mapped = json.loads(rig.get('deadlock_retarget_mapping', '{}'))
+            heights = [(rig.matrix_world @ rig.data.bones[name].head_local).z for name in mapped if name in rig.data.bones]
+            thickness = max(max(heights, default=1) - min(heights, default=0), 0.01) * 0.0015 / UNIT
         rows = []
         lengths, parents = {}, {}
         for bone in members:
@@ -134,9 +179,9 @@ def export_chains(rig, names):
                          'end_effector': length if not bone.children else 0.0,
                          'extrude_radius': max(0.1, length * 0.1),
                          'extrude_sides':3 if entry.get('stable_rotation_frames',False) else 2,
-                         'goal_strength': entry['stiffness'], 'goal_damping': entry['damping'],
-                         'torsion_spring':entry.get('twist_resistance',0.2),
-                         'gravity_z': entry['gravity']})
+                         **{field: per_bone[bone.name] for field, per_bone in values.items()}})
+            if entry.get('auto_collision'):
+                rows[-1].update(vertex_map=VERTEX_MAP, collision_radius=thickness)
         defaults = {
             'joint_name': '', 'joint_parent': '', 'simulate': True, 'allow_rotation': True,
             'lock_translation': False, 'stretch_spring': 1.0, 'bend_spring': 0.8,
@@ -146,6 +191,10 @@ def export_chains(rig, names):
             'extrude_forward_axis': 'y', 'twist_relax': 1.0, 'extra_iterations': 2,
             'collision_radius': 0.0, 'antishrink': 1.0,
         }
+        if entry.get('use_motion_limits'):
+            defaults.update(stray_radius=0.0, stray_radius_stretchiness=0.0)
+        if entry.get('auto_collision'):
+            defaults['vertex_map'] = ''
         # Original Blender bones run along +Y. Extruded bases with twist_relax
         # avoid the legacy rope solver's +X-only alignment requirement.
         attrs = {key: {'display': key, 'default': value, 'show': True, 'ui_order': i}
@@ -157,12 +206,12 @@ def export_chains(rig, names):
                 'chain': {'version': 2, 'joints': rows, 'attrs': attrs, 'selection': []}}
         if entry.get('lock_twist') and any(row['allow_rotation'] for row in rows):
             from .physics_swing import export_swing
-            node['_swing_only'] = export_swing(rows, lengths, parents, entry, UNIT)
+            node['_swing_only'] = export_swing(rows, lengths, parents, UNIT)
         result.append(node)
     return result
 
 
-def append_physics_modeldoc(document, nodes):
+def append_physics_modeldoc(document, nodes, colliders=()):
     if not nodes:
         return document
     from .core import class_spans
@@ -196,7 +245,7 @@ def append_physics_modeldoc(document, nodes):
             addition = kv({'_class': node_class, 'children': list(defaults) + children}) + ', '
         return document[:offset] + addition + document[offset:]
 
-    cloth, jiggles = [], []
+    cloth, jiggles = list(colliders), []
     for node in nodes:
         if '_swing_only' in node:
             cloth.extend(node['_swing_only']['cloth'])
@@ -211,7 +260,40 @@ def append_physics_modeldoc(document, nodes):
     return document
 
 
-def validate_compiled_physics(compiled, path, nodes):
+def validate_compiled_limits(fe, rows, unit):
+    """Require authored bounds on simulated joints and their support points."""
+    names = [str(name) for name in fe['m_CtrlName']]
+    static = int(fe['m_nStaticNodes'])
+    stretch_scale = math.exp(-float(fe.get('m_flDefaultThreadStretch', 0.0)))
+    records = {}
+    for record in fe.get('m_AnimStrayRadii', []):
+        left, right = (int(value) for value in record['nNode'])
+        if left == right:
+            records[left] = (float(record['flMaxDist']), float(record['flRelaxationFactor']))
+    checked = []
+    for row in rows:
+        # Allowing an anchor to rotate does not simulate its position. The
+        # compiler keeps its controls static and omits redundant distance limits.
+        if 'stray_radius' not in row or not row['simulate']:
+            continue
+        name = row['joint_name']
+        radius = row['stray_radius']
+        strength = 1.0 - row.get('stray_radius_stretchiness', 0.0)
+        actual = [records[index] for index, control in enumerate(names) if index >= static and index in records
+                  and (control == name or control.startswith('$cc' + name + '_'))]
+        if radius <= 0 or strength <= 0:
+            if actual:
+                raise ValueError('Disabled motion limit still compiled: ' + name)
+            continue
+        if not actual or any(not math.isclose(distance, radius, rel_tol=1e-4, abs_tol=1e-5)
+                             or not math.isclose(relaxation, strength * stretch_scale, rel_tol=1e-4, abs_tol=1e-5)
+                             for distance, relaxation in actual):
+            raise ValueError('Motion limit did not compile as requested: ' + name)
+        checked.append({'bone': name, 'radius_meters': radius * unit, 'strength': strength})
+    return checked
+
+
+def validate_compiled_physics(compiled, path, nodes, colliders=()):
     """Require real compiled dynamic nodes and correct skeleton bindings."""
     if not nodes:
         return {'enabled': False, 'chains': []}
@@ -274,7 +356,13 @@ def validate_compiled_physics(compiled, path, nodes):
                         'anchored_bones':[row['joint_name'] for row in rows if not row['simulate']],
                         'rotation_frame_points':rows[0].get('extrude_sides',2),
                         'twist_resistance':rows[0].get('torsion_spring',0.2)})
+        if any('stray_radius' in row for row in rows):
+            checked[-1]['motion_limits'] = validate_compiled_limits(fe, rows, UNIT)
+    collision = 'No body or world collision; accessory secondary motion only'
+    if colliders:
+        from .physics_collision import validate_colliders
+        collision = validate_colliders(fe, colliders, [row for node in nodes for row in node['chain']['joints']], UNIT)
     return {'enabled': True, 'chains': checked, 'compiled_nodes': int(fe['m_nNodeCount']),
             'static_nodes': static, 'runtime_simulation_verified': False,
             'max_physics_rest_position_error_meters': maximum_rest_error,
-            'collision': 'No body or world collision; accessory secondary motion only'}
+            'collision': collision}

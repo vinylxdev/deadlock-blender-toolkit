@@ -396,6 +396,33 @@ def embedded_animation_model(retail_bytes, replacement):
     return replace_resource_blocks(retail_bytes, {index: bytes(buffer.data)})
 
 
+def compatible_extraction_model(retail_bytes, replacement):
+    """Re-encode model KV3 for older Viewers, only in an extraction copy."""
+    from . import read_resource, sourceio
+    from SourceIO.library.source2.blocks.kv3_block import KVBlock
+    from SourceIO.library.source2.keyvalues3.enums import KV3Signature, KV3CompressionMethod
+    from SourceIO.library.source2.keyvalues3.binary_keyvalues import write_valve_keyvalue3
+    model = read_resource(retail_bytes, replacement, model=True)
+    utils, _, _ = sourceio()
+    replacements = {}
+    for index, info in enumerate(model._header.blocks):
+        if not KV3Signature.is_valid(retail_bytes[info.absolute_offset:info.absolute_offset+4]):
+            continue
+        # Keep the complete dictionaries, including dependency fields unknown
+        # to edit-info wrappers. Mesh/index buffers and other binary blocks stay
+        # byte-identical. Retail runtime bindings never use this extraction copy.
+        metadata = model.get_block(KVBlock, block_id=index)
+        buffer = utils.WritableMemoryBuffer()
+        # V1 keeps blobs inline and uses full-size counts, accommodating large
+        # animation tables as well as old Viewers' scalar-type support.
+        write_valve_keyvalue3(buffer, metadata, metadata._format, KV3Signature.KV3_V1,
+                             KV3CompressionMethod.UNCOMPRESSED)
+        replacements[index] = bytes(buffer.data)
+    if not replacements:
+        raise ValueError('Hero has no KV3 data to adapt for Source 2 Viewer')
+    return replace_resource_blocks(retail_bytes, replacements)
+
+
 def extract_hero(cli, retail_bytes, replacement, game_dir, content_root, output, progress):
     output=Path(output)
     original=output/'retail'/Path(replacement).name
@@ -409,28 +436,42 @@ def extract_hero(cli, retail_bytes, replacement, game_dir, content_root, output,
     destination.parent.mkdir(parents=True,exist_ok=True)
     progress('Extracting hero ModelDoc and native weapon/animation sources')
     log = output/'extract.log'
-    start = log.stat().st_size if log.exists() else 0
-    error = None
-    try:
-        run_tool([str(cli),'-i',str(original),'-o',str(destination),'--game',str(search_info)],
-                 original.parent,log)
-    except ValueError as failure:
-        error = failure
-    # Some Viewer versions report decompiler exceptions but still exit with zero.
-    with log.open('rb') as stream:
-        stream.seek(start)
-        diagnostics = stream.read().decode('utf-8', errors='replace')
-    if 'Unknown KVType' in diagnostics and 'AnimationGraphLoader.' in diagnostics:
-        progress('Viewer cannot read the hero animation graph; extracting embedded animations')
-        fallback = original.parent/'embedded'/original.name
-        fallback.parent.mkdir(exist_ok=True)
-        fallback.write_bytes(embedded_animation_model(retail_bytes, replacement))
+    source, extraction_bytes = original, retail_bytes
+    data_adapted = graph_omitted = False
+    for _ in range(3):
+        start = log.stat().st_size if log.exists() else 0
+        previous = destination.stat().st_mtime_ns if destination.exists() else None
+        error = None
+        try:
+            run_tool([str(cli),'-i',str(source),'-o',str(destination),'--game',str(search_info)],source.parent,log)
+        except ValueError as failure:
+            error = failure
+        # Some Viewer versions print decompiler exceptions but exit with zero.
+        with log.open('rb') as stream:
+            stream.seek(start)
+            diagnostics = stream.read().decode('utf-8', errors='replace')
+        unknown = 'Unknown KVType' in diagnostics
+        if unknown and 'AnimationGraphLoader.' in diagnostics and not graph_omitted:
+            progress('Viewer cannot read the hero animation graph; extracting embedded animations')
+            extraction_bytes = embedded_animation_model(extraction_bytes, replacement)
+            graph_omitted = True
+            folder = 'embedded'
+        elif unknown and any(frame in diagnostics for frame in ('ResourceEditInfo2.Read', 'KeyValuesOrNTRO.Read')) and not data_adapted:
+            progress('Adapting hero resource data for this Source 2 Viewer version')
+            extraction_bytes = compatible_extraction_model(extraction_bytes, replacement)
+            data_adapted = True
+            folder = 'compatible'
+        else:
+            if error:
+                raise error
+            if unknown:
+                raise ValueError(f'Source 2 Viewer cannot decode this hero resource; see {log}')
+            if not destination.is_file() or destination.stat().st_mtime_ns == previous:
+                raise ValueError(f'Source 2 Viewer did not write the requested hero ModelDoc; see {log}')
+            return destination
+        source = original.parent/folder/original.name
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(extraction_bytes)
         # A previous extraction must not disguise a zero-exit retry failure.
         destination.unlink(missing_ok=True)
-        run_tool([str(cli),'-i',str(fallback),'-o',str(destination),'--game',str(search_info)],
-                 fallback.parent,log)
-    elif error:
-        raise error
-    if not destination.is_file():
-        raise ValueError(f'Source 2 Viewer did not write the requested hero ModelDoc; see {log}')
-    return destination
+    raise ValueError(f'Source 2 Viewer could not extract the hero ModelDoc; see {log}')

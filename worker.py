@@ -68,6 +68,7 @@ def run(config):
         retarget = config.get('retarget', False)
         constraints = None
         skeleton = None
+        countdown_names = []
         if retarget:
             from .retarget_export import prepare_retarget_export,retarget_modeldoc
             progress(f'Preparing original rig retarget for {name}')
@@ -96,7 +97,15 @@ def run(config):
             from .physics import append_physics_modeldoc
             export_rig=next(o for o in collection.objects if o.type=='ARMATURE')
             physics_nodes=json.loads(export_rig.get('deadlock_physics_nodes','[]'))
-            document=append_physics_modeldoc(document,physics_nodes)
+            physics_colliders=json.loads(export_rig.get('deadlock_physics_colliders','[]'))
+            document=append_physics_modeldoc(document,physics_nodes,physics_colliders)
+            from .retarget_respawn import respawn_modeldoc, bake_respawn_idle
+            countdown_resource=f'models/deadlock_toolkit/{key}/{stem}_respawn_idle.dmx'
+            document,countdown_names=respawn_modeldoc(document,countdown_resource)
+            if countdown_names:
+                progress('Baking first idle frame for the respawn countdown pose')
+                report['respawn_idle'],countdown_pose=bake_respawn_idle(settings,skeleton,constraints,content/countdown_resource)
+                report['respawn_idle']['animations']=countdown_names
         model.write_text(document,encoding='utf-8')
         preview=output/('retarget_export_preview.blend' if retarget else 'converted_preview.blend')
         bpy.data.libraries.write(str(preview),{collection},path_remap='ABSOLUTE',fake_user=True)
@@ -136,8 +145,11 @@ def run(config):
             from .retarget_validation import validate_retarget_export
             progress('Verifying compiled original skeleton and retargeted idle pose')
             report['retarget_validation']=validate_retarget_export(compiled.read_bytes(),replacement,collection,skeleton,constraints,settings)
+            if countdown_names:
+                from .retarget_respawn import validate_respawn_idle
+                report['respawn_idle']['validation']=validate_respawn_idle(compiled.read_bytes(),replacement,countdown_names,countdown_pose)
             from .physics import validate_compiled_physics
-            report['physics_validation']=validate_compiled_physics(compiled.read_bytes(),replacement,physics_nodes)
+            report['physics_validation']=validate_compiled_physics(compiled.read_bytes(),replacement,physics_nodes,physics_colliders)
         progress('Validating compiled dependency closure and packaging VPK')
         files=addon.collect_compiled(game,compiled,replacement,retail,retail_staged)
         vpk=Path(config['vpk_path']) if config.get('vpk_path') else output/f'{stem}_{key}.vpk'

@@ -7,14 +7,12 @@ Helpers align the native jiggle +Z axis with each original bone's +Y axis.
 import math
 
 
-def export_swing(rows, lengths, parents, entry, unit):
+def export_swing(rows, lengths, parents, unit):
     moving = {row['joint_name']: '_dlt_swing_' + row['joint_name']
               for row in rows if row['allow_rotation']}
     helpers, jiggles, cloth = [], [], []
     # Native flexible jiggles use separate pitch/yaw springs, rather than
     # cloth's normalized goal attraction. Keep their authored ranges bounded.
-    stiffness = 1000.0 * entry['stiffness']
-    damping = 10.0 * entry['damping']
     for row in rows:
         name = row['joint_name']
         cloth.append({'_class': 'ClothNode', 'name': 'avatar_swing_node_' + name,
@@ -23,11 +21,13 @@ def export_swing(rows, lengths, parents, entry, unit):
         if name not in moving:
             continue
         helper = moving[name]
+        stiffness = 1000.0 * row['goal_strength']
+        damping = 10.0 * row['goal_damping']
         parent = parents[name]
         helpers.append({'name': helper, 'target': name, 'parent': moving.get(parent, parent)})
         jiggles.append({'_class': 'JiggleBone', 'name': 'avatar_swing_' + name,
                         'jiggle_root_bone': helper, 'jiggle_type': 1,
-                        'length': lengths[name], 'tip_mass': entry['gravity'] * 9.80665 / unit,
+                        'length': lengths[name], 'tip_mass': row['gravity_z'] * 9.80665 / unit,
                         'yaw_stiffness': stiffness, 'pitch_stiffness': stiffness,
                         'yaw_damping': damping, 'pitch_damping': damping,
                         'allow_flex_length': False, 'has_base_spring': False,

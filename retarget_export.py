@@ -67,6 +67,8 @@ def prepare_retarget_export(settings):
              for i, b in enumerate(source.data.bones)}
     from .physics import export_chains, KEY
     physics_nodes = export_chains(source, names)
+    from .physics_collision import fit_body_colliders
+    physics_colliders = fit_body_colliders(source, names)
     parents = {b.name: b.parent.name if b.parent else None for b in source.data.bones}
     root = 'root_motion' if 'root_motion' in reference else next(b.name for b in native_bones if not b.parent)
     runtime_root=runtime_root_reference(settings,reference,root)
@@ -214,6 +216,7 @@ def prepare_retarget_export(settings):
         rig['deadlock_retarget_constraints'] = json.dumps(constraints)
         rig['deadlock_retarget_weapon_binding'] = json.dumps(weapon)
         rig['deadlock_physics_nodes'] = json.dumps(physics_nodes)
+        rig['deadlock_physics_colliders'] = json.dumps(physics_colliders)
         if KEY in rig:
             del rig[KEY]
         rig['deadlock_retarget_runtime_roots'] = json.dumps({root:[list(row) for row in runtime_root]})

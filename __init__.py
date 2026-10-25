@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Deadlock Blender Toolkit",
     "author": "Vinyl",
-    "version": (0, 3, 27),
+    "version": (0, 3, 35),
     "blender": (5, 2, 0),
     "location": "3D View > Sidebar > Deadlock Toolkit",
     "description": "Choose a hero, inspect its rig, export FBX, compile and package a prepared replacement",
@@ -27,6 +27,7 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 from .core import VPK, hero_catalog, hero_labels, pack_vpk, patch_modeldoc, resource_path
+from .physics_ui import CURVE_ITEMS
 
 UNIT = 0.0254  # Source 2 inch -> Blender meter, as used by SourceIO.
 _catalog = []  # Keep strings alive for Blender's dynamic EnumProperty.
@@ -635,13 +636,52 @@ class DL_OT_physics_chain(bpy.types.Operator):
     bl_label = 'Add Physics Chain'
     bl_description = 'Choose an accessory root; it stays attached while its descendants simulate in the exported VPK'
     bl_options = {'REGISTER', 'UNDO'}
+    settings_tab: EnumProperty(name='Section', default='MOTION', options={'HIDDEN', 'SKIP_SAVE'},
+                               items=(('MOTION', 'Motion', 'Movement and limits'),
+                                      ('CURVES', 'Curves', 'Edit a profile along the chain'),
+                                      ('ADVANCED', 'Advanced', 'Attachment and rotation stability')))
+    curve_setting: EnumProperty(name='Setting', items=CURVE_ITEMS, default='stiffness',
+                                options={'HIDDEN', 'SKIP_SAVE'})
     root: StringProperty(name='Root bone')
     stiffness: FloatProperty(name='Return to pose', default=0.5, min=0, max=1,
                              description='Animation attraction: higher values retain the original accessory shape')
+    use_stiffness_curve: BoolProperty(name='Pose attraction curve', default=False,
+                                     description='Scale Return to pose along each branch: left is the root, right is the tip; height is a multiplier from 0 to 1')
+    stiffness_curve_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    stiffness_curve_data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     damping: FloatProperty(name='Damping', default=0.5, min=0, max=1)
+    use_damping_curve: BoolProperty(name='Damping curve', default=False,
+                                   description='Multiply Damping by a curve from the base to the tip of each branch')
+    damping_curve_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    damping_curve_data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     gravity: FloatProperty(name='Gravity', default=0.3, min=0, max=2)
+    use_gravity_curve: BoolProperty(name='Gravity curve', default=False,
+                                   description='Multiply Gravity by a curve from the base to the tip of each branch')
+    gravity_curve_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    gravity_curve_data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     twist_resistance: FloatProperty(name='Twist resistance',default=0.2,min=0,max=1,
                                     description='Torsion spring strength on longer chains: higher values resist twisting; this is not a hard angle limit')
+    use_twist_resistance_curve: BoolProperty(name='Twist resistance curve', default=False,
+                                           description='Multiply the cloth torsion spring by a curve from base to tip; native jiggle exports do not use this spring')
+    twist_resistance_curve_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    twist_resistance_curve_data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    use_motion_limits: BoolProperty(name='Limit motion', default=False,
+                                   description='Bound cloth motion around each bone’s animated pose')
+    auto_collision: BoolProperty(name='Automatic collision fitting', default=False,
+                                 description='Fit capsules to the weighted body mesh and make this chain collide with them in preview and game export; requires Lock twist off')
+    motion_limit: FloatProperty(name='Motion radius', default=0.01, min=0, soft_max=1,
+                               subtype='DISTANCE', unit='LENGTH', precision=4,
+                               description='Maximum distance from the animated pose, stored in meters; zero disables the limit for that bone')
+    use_motion_limit_curve: BoolProperty(name='Motion radius curve', default=False,
+                                        description='Multiply the motion radius along each branch; a zero multiplier disables that bone’s limit')
+    motion_limit_curve_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    motion_limit_curve_data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    motion_limit_strength: FloatProperty(name='Limit strength', default=1, min=0, max=1,
+                                        description='How firmly to enforce the radius: 1 is a hard limit, lower values allow some overshoot, and 0 disables it')
+    use_motion_limit_strength_curve: BoolProperty(name='Limit strength curve', default=False,
+                                                 description='Multiply the limit strength along each branch')
+    motion_limit_strength_curve_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    motion_limit_strength_curve_data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     lock_root_rotation: BoolProperty(name='Lock root rotation',default=True,
                                     description='Keep the pinned root’s animated orientation instead of letting simulation roll it; descendants still bend')
     lock_twist: BoolProperty(name='Lock twist (swing only)', default=False,
@@ -655,6 +695,7 @@ class DL_OT_physics_chain(bpy.types.Operator):
 
     def invoke(self, context, event):
         from .physics import physics_rig, chains
+        from .physics_curve import prepare_editors, clear_editors
         rig=physics_rig(context,context.scene.deadlock_export)
         if rig is None:
             self.report({'ERROR'},'Create Retarget Original Rig Preview first')
@@ -672,31 +713,42 @@ class DL_OT_physics_chain(bpy.types.Operator):
         elif context.object and context.object.type=='ARMATURE' and context.object.data.bones.active:
             candidate=context.object.data.bones.active.name
             if candidate in rig.data.bones: self.root=candidate
-        return context.window_manager.invoke_props_dialog(self,width=400)
+        stored = entries[self.index] if self.index >= 0 else {}
+        self.use_motion_limits = stored.get('use_motion_limits', False)
+        self.auto_collision = stored.get('auto_collision', False)
+        self.motion_limit = stored.get('motion_limit', 0.01)
+        self.motion_limit_strength = stored.get('motion_limit_strength', 1.0)
+        prepare_editors(self, entries[self.index] if self.index >= 0 else {})
+        self.settings_tab = 'MOTION'
+        self.curve_setting = 'stiffness'
+        try:
+            return context.window_manager.invoke_props_dialog(
+                self, width=520, title='Edit Physics Chain' if self.index >= 0 else 'Add Physics Chain',
+                confirm_text='Apply')
+        except Exception:
+            clear_editors(self)
+            raise
 
     def draw(self, context):
-        rig=bpy.data.objects.get(self.rig_name)
-        if rig: self.layout.prop_search(self,'root',rig.data,'bones')
-        self.layout.label(text='Root stays attached; includes all descendants')
-        self.layout.prop(self,'stiffness')
-        self.layout.prop(self,'damping')
-        self.layout.prop(self,'gravity')
-        self.layout.prop(self,'lock_root_rotation')
-        self.layout.prop(self,'lock_twist')
-        if self.lock_twist:
-            self.layout.label(text='Game export uses native jiggle bones', icon='INFO')
-        self.layout.prop(self,'twist_resistance')
-        self.layout.prop(self,'anchor_child_roots')
-        self.layout.prop(self,'stable_rotation_frames')
+        from .physics_ui import draw_dialog
+        draw_dialog(self.layout, self, bpy.data.objects.get(self.rig_name))
+
+    def check(self, context):
+        # Tabs and optional controls change the dialog's visible layout.
+        return True
 
     def execute(self, context):
         from .physics import physics_rig, chains, validate_chains, KEY
+        from .physics_curve import store_curves, clear_editors
         settings=context.scene.deadlock_export
         try:
             rig=bpy.data.objects.get(self.rig_name) if self.rig_name else physics_rig(context,settings)
             if rig is None: raise ValueError('Create Retarget Original Rig Preview first')
             entries=chains(rig)
             entry={key:getattr(self,key) for key in ('root','stiffness','damping','gravity','twist_resistance','lock_root_rotation','anchor_child_roots','stable_rotation_frames','lock_twist')}
+            entry.update(use_motion_limits=self.use_motion_limits, motion_limit=self.motion_limit,
+                         motion_limit_strength=self.motion_limit_strength, auto_collision=self.auto_collision)
+            store_curves(self, entry)
             index=self.index
             if index<0: index=next((i for i,e in enumerate(entries) if e['root']==self.root),-1)
             if index>=len(entries): raise ValueError('Physics chain no longer exists')
@@ -709,6 +761,12 @@ class DL_OT_physics_chain(bpy.types.Operator):
             settings.status=f'Physics chain {self.root} configured. Preview Physics to test; Build Retargeted VPK to apply.'
             return {'FINISHED'}
         except Exception as error: return report_error(self,settings,error)
+        finally:
+            clear_editors(self)
+
+    def cancel(self, context):
+        from .physics_curve import clear_editors
+        clear_editors(self)
 
 
 class DL_OT_physics_remove(bpy.types.Operator):

@@ -27,6 +27,9 @@ class Preview:
         self.rig, self.scene, self.view_layer = rig, context.scene, context.view_layer
         self.config = rig.get(KEY)
         self.names = [row['joint_name'] for node in nodes for row in node['chain']['joints']]
+        from .physics_collision import fit_body_colliders
+        self.colliders = fit_body_colliders(rig)
+        self.goal_names = list(dict.fromkeys(self.names + [shape['parent_bone'] for shape in self.colliders]))
         if any(constraint for name in self.names for constraint in rig.pose.bones[name].constraints
                if not constraint.mute):
             raise ValueError('Remove accessory bone constraints on the preview copy before simulating')
@@ -58,12 +61,15 @@ class Preview:
 
     def goals(self, depsgraph):
         rig = self.rig.evaluated_get(depsgraph)
-        return {name: rig.matrix_world @ rig.pose.bones[name].matrix for name in self.names}
+        return {name: rig.matrix_world @ rig.pose.bones[name].matrix for name in self.goal_names}
 
     def apply(self, goals, seconds):
+        from . import UNIT
+        from .physics_collision import world_capsules
+        capsules = world_capsules(self.colliders, goals, UNIT) if self.colliders else ()
         matrices = {}
         for solver in self.solvers:
-            solver.advance(goals, seconds)
+            solver.advance(goals, seconds, colliders=capsules)
             matrices.update(solver.matrices(goals))
         inverse = self.rig.matrix_world.inverted()
         # Parent-before-child conversion avoids reading stale pose matrices
