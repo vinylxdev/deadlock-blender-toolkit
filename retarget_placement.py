@@ -36,7 +36,8 @@ def preserve_proportions(rig, restore_original=True):
         native=[reference[r].translation for r in roles]
         lengths.append((sum((b-a).length for a,b in zip(native,native[1:])),
                         sum((b-a).length for a,b in zip(authored,authored[1:]))))
-    scale=sum(a for a,b in lengths)/sum(b for a,b in lengths)
+    from .retarget_size import avatar_scale
+    scale=sum(a for a,b in lengths)/sum(b for a,b in lengths)*avatar_scale(rig)
     if not 0.1<scale<10:raise ValueError('Invalid avatar leg scale')
     anchor=(reference['ankle_L'].translation+reference['ankle_R'].translation)*0.5
     fit=Matrix.Translation(anchor)@Matrix.Scale(scale,4)@Matrix.Translation(-anchor)

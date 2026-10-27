@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Deadlock Blender Toolkit",
     "author": "Vinyl",
-    "version": (0, 3, 35),
+    "version": (0, 3, 36),
     "blender": (5, 2, 0),
     "location": "3D View > Sidebar > Deadlock Toolkit",
     "description": "Choose a hero, inspect its rig, export FBX, compile and package a prepared replacement",
@@ -584,6 +584,31 @@ class DL_OT_preserve_retarget_proportions(bpy.types.Operator):
             settings.status='Original proportions restored with uniform sizing and whole-pose ground placement. Build Retargeted VPK to export.'
             return {'FINISHED'}
         except Exception as error:return report_error(self,settings,error)
+
+
+class DL_OT_fit_avatar_height(bpy.types.Operator):
+    bl_idname = 'deadlock.fit_avatar_height'
+    bl_label = 'Fit Height to Hero'
+    bl_description = 'Uniformly scale the entire preview to the base hero body height, measured in rest pose with current shape keys and modifiers'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        from .physics import physics_rig
+        rig = physics_rig(context, context.scene.deadlock_export)
+        return (not context.window_manager.get('deadlock_build_running', False)
+                and rig is not None and bool(rig.get('deadlock_retarget_mapping')))
+
+    def execute(self, context):
+        settings = context.scene.deadlock_export
+        try:
+            from .physics import physics_rig
+            from .retarget_size import fit_hero_height
+            height = fit_hero_height(physics_rig(context, settings), settings)
+            settings.status = f'Avatar fitted to the base hero height ({height:.3f} m); Build Retargeted VPK to export.'
+            return {'FINISHED'}
+        except Exception as error:
+            return report_error(self, settings, error)
 
 
 class DL_OT_idle_preview(bpy.types.Operator):
@@ -1265,6 +1290,11 @@ class DL_PT_export(bpy.types.Panel):
             body.operator('deadlock.retarget_original_preview', icon='CONSTRAINT_BONE')
             from .preview import preview_rig, RESTORE_KEY
             rig = preview_rig(context, settings)
+            from .physics import physics_rig
+            size_rig = physics_rig(context, settings)
+            if size_rig is not None and size_rig.get('deadlock_retarget_mapping'):
+                body.prop(size_rig, 'deadlock_avatar_scale')
+            body.operator('deadlock.fit_avatar_height', icon='FULLSCREEN_ENTER')
             body.separator()
             idle_active = rig is not None and RESTORE_KEY in rig
             body.operator('deadlock.toggle_idle_preview',
@@ -1372,7 +1402,8 @@ def find_game():
 
 
 _classes = (DL_Material, DL_Settings, DL_OT_refresh, DL_OT_reference, DL_OT_check,
-            DL_OT_export, DL_OT_materials, DL_OT_retarget_preview, DL_OT_fit_retarget_legs, DL_OT_preserve_retarget_proportions, DL_OT_idle_preview,
+            DL_OT_export, DL_OT_materials, DL_OT_retarget_preview, DL_OT_fit_retarget_legs, DL_OT_preserve_retarget_proportions,
+            DL_OT_fit_avatar_height, DL_OT_idle_preview,
             DL_OT_physics_preview, DL_OT_physics_chain, DL_OT_physics_remove, DL_OT_physics_save, DL_OT_physics_load,
             DL_OT_automatic, DL_OT_build, DL_OT_copy_status, DL_PT_export)
 
@@ -1410,9 +1441,14 @@ def on_file_loaded(_):
 
 
 def register():
+    from .retarget_size import avatar_scale, set_avatar_scale
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.deadlock_export = PointerProperty(type=DL_Settings)
+    bpy.types.Object.deadlock_avatar_scale = FloatProperty(
+        name='Overall size', default=1.0, min=0.01, soft_min=0.1, soft_max=3.0, precision=3,
+        description='Uniform size multiplier for this retarget preview; 1 is its initial size. Also affects VPK export',
+        get=avatar_scale, set=set_avatar_scale)
     bpy.app.handlers.load_post.append(on_file_loaded)
     bpy.app.timers.register(initialize_settings, first_interval=0.1)
 
@@ -1428,6 +1464,7 @@ def unregister():
     if on_file_loaded in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(on_file_loaded)
     del bpy.types.Scene.deadlock_export
+    del bpy.types.Object.deadlock_avatar_scale
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     _catalog.clear()

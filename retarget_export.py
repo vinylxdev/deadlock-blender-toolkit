@@ -240,6 +240,7 @@ def prepare_retarget_export(settings):
               'leg_joint_positions_follow_native': not bool(source.get('deadlock_retarget_preserve_proportions')),
               'preserve_avatar_proportions':bool(source.get('deadlock_retarget_preserve_proportions')),
               'uniform_avatar_scale':source.matrix_world.to_scale().x,
+              'avatar_overall_size':source.get('deadlock_avatar_scale',1.0),
               'whole_pose_offset_meters':list(position_offsets.get('pelvis_root_shift',Vector((0,0,0)))),
               'foot_contact_offsets_meters':{name:list(offset) for name,offset in position_offsets.items()},
               'root_motion_binding': {'driver':root,'model_bind_transform':[list(row) for row in reference[root]],
