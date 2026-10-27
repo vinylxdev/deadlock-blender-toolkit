@@ -16,8 +16,6 @@ I will add more supported types when I get the time.
 - **[Source 2 Viewer CLI](https://github.com/ValveResourceFormat/ValveResourceFormat/releases)** for your operating system. Select the CLI executable, rather than the graphical viewer.
 - **[Reduced CSDK 12](https://deadlockmodding.pages.dev/modding-tools/csdk-12)** for compiling models and materials.
 
-On Windows, select `Source2Viewer-CLI.exe` and the SDK containing `resourcecompiler.exe`. Wine is only required on Linux, where both `wine` and `winepath` must be on `PATH`. Linux with Wine is the validated build environment; native Windows execution still needs an end-to-end build test. No separate Python installation is required to use the add-on.
-
 ## Install
 
 1. Download this repository using **Code → Download ZIP** or use the zip from Releases.
