@@ -382,6 +382,27 @@ def run_tool(command, cwd, log, environment=None, timeout=900):
         raise ValueError(f'Tool exited with code {completed.returncode}; see {log}')
 
 
+def run_compiler(command, cwd, log, environment=None, timeout=900):
+    """Retry one intermittent Wine mapping assertion using the same exported sources."""
+    log = Path(log)
+    offset = log.stat().st_size if log.exists() else 0
+    try:
+        run_tool(command, cwd, log, environment, timeout)
+    except ValueError:
+        if (len(command) < 2 or Path(command[0]).name not in ('wine', 'wine64') or
+                Path(command[1]).name.lower() != 'resourcecompiler.exe'):
+            raise
+        with log.open('rb') as stream:
+            stream.seek(offset)
+            diagnostic = stream.read()
+        if (b'create_view: Assertion' not in diagnostic or
+                b'view->protect & VPROT_SYSTEM' not in diagnostic):
+            raise
+        with log.open('a', encoding='utf-8') as stream:
+            stream.write('\nRetrying compiler after Wine create_view mapping assertion (1/1).\n')
+        run_tool(command, cwd, log, environment, timeout)
+
+
 def embedded_animation_model(retail_bytes, replacement):
     """Omit AG2 traversal from an extraction copy; runtime bindings use retail bytes."""
     from . import read_resource, sourceio

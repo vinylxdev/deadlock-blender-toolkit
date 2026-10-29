@@ -91,8 +91,8 @@ def set_avatar_scale(rig, value):
         settings.status = str(error)
 
 
-def avatar_height(rig):
-    """World Z extent of the exportable rest mesh, including keys and modifiers."""
+def avatar_bounds(rig):
+    """World Z bounds of the exportable rest mesh, including keys and modifiers."""
     previous = rig.data.pose_position
     lower, upper = math.inf, -math.inf
     try:
@@ -116,12 +116,41 @@ def avatar_height(rig):
     height = upper - lower
     if not math.isfinite(height) or height <= 1e-6:
         raise ValueError('The avatar has no measurable render-enabled mesh height')
+    return lower, upper
+
+
+def avatar_height(rig):
+    lower, upper = avatar_bounds(rig)
+    return upper - lower
+
+
+def eye_height(heights, ground, subject):
+    """Average the available eye centers; ignore eye-end and other facial bones."""
+    eyes = []
+    for side in ('L', 'R'):
+        name = next((name for name in (f'eye_0_{side}', f'eye_{side}') if name in heights), None)
+        if name:
+            eyes.append(heights[name])
+    if not eyes:
+        raise ValueError(f'{subject} has no mapped eye bones; adjust Overall size manually')
+    height = sum(eyes) / len(eyes) - ground
+    if not math.isfinite(height) or height <= 1e-6:
+        raise ValueError(f'{subject} has no measurable ground-to-eye height')
     return height
 
 
+def avatar_eye_height(rig):
+    """Rest eye-bone height above the evaluated render mesh's lowest point."""
+    mapping = json.loads(rig['deadlock_retarget_mapping'])
+    heights = {role: (rig.matrix_world @ rig.data.bones[name].head_local).z
+               for name, role in mapping.items() if name in rig.data.bones}
+    ground, _ = avatar_bounds(rig)
+    return eye_height(heights, ground, 'The avatar')
+
+
 def hero_height(settings):
-    """Default LOD0 body render bounds in meters; separate weapon props are omitted."""
-    from . import UNIT, archive, read_resource, selected_hero
+    """Rest eye-bone height above default LOD0 body bounds, omitting weapon props."""
+    from . import UNIT, archive, read_resource, selected_hero, bone_matrices
     _, _, path = selected_hero(settings)
     retail = archive(settings)
     resource = read_resource(retail.read(path), path, model=True)
@@ -151,14 +180,13 @@ def hero_height(settings):
             bounds.append((float(obj['m_vMinBounds'][2]), float(obj['m_vMaxBounds'][2])))
     if not bounds or any(not math.isfinite(z) for pair in bounds for z in pair):
         raise ValueError('The selected hero has no measurable body render bounds')
-    height = (max(hi for lo, hi in bounds) - min(lo for lo, hi in bounds)) * UNIT
-    if height <= 1e-6:
-        raise ValueError('The selected hero has no measurable body height')
-    return height
+    reference = bone_matrices(resource.get_bones())
+    return eye_height({name: matrix.translation.z for name, matrix in reference.items()},
+                      min(lo for lo, hi in bounds) * UNIT, 'The selected hero')
 
 
 def fit_hero_height(rig, settings):
     height = hero_height(settings)
-    value = avatar_scale(rig) * height / avatar_height(rig)
+    value = avatar_scale(rig) * height / avatar_eye_height(rig)
     scale_avatar(rig, value)
     return height

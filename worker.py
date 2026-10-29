@@ -49,7 +49,7 @@ def run(config):
     bpy.context.view_layer.update()
     from .conversion import create_converted
     from .materials import bake_materials
-    from .pipeline import extract_hero,run_tool,compiler_environment,repair_runtime_bindings,prepare_sdk_workspace,stage_retail_materials,validate_compiled_model,validate_compiled_materials,validate_compiled_geometry,validate_native_weapon_meshes,install_vpk
+    from .pipeline import extract_hero,run_compiler,compiler_environment,repair_runtime_bindings,prepare_sdk_workspace,stage_retail_materials,validate_compiled_model,validate_compiled_materials,validate_compiled_geometry,validate_native_weapon_meshes,install_vpk
     from .core import automatic_modeldoc,native_weapon_meshes,pack_vpk
     status_path=Path(config['status_path'])
     def progress(stage, state='running', **fields):
@@ -130,7 +130,7 @@ def run(config):
         command=addon.compiler_command(compiler,game,model,environment=environment,shallow=True)
         compiled=game/(model_resource+'_c')
         if compiled.exists():compiled.unlink()
-        run_tool(command,compiler.parent,output/('retarget_compile.log' if retarget else 'compile.log'),environment)
+        run_compiler(command,compiler.parent,output/('retarget_compile.log' if retarget else 'compile.log'),environment)
         if not compiled.is_file():
             raise ValueError('Compiler did not create the new model in the addon game folder')
         progress('Preserving retail animation bindings and gameplay metadata')

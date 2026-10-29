@@ -1,4 +1,4 @@
-"""Uniform size, real mesh-height fitting, grounding and runtime export agreement.
+"""Uniform size, eye-height fitting, grounding and runtime export agreement.
 
 blender -b --factory-startup --python-exit-code 1 --python tests/blender_retarget_size.py
 No game, SDK or SourceIO installation required.
@@ -41,7 +41,9 @@ source.select_set(True)
 bpy.ops.object.mode_set(mode='EDIT')
 rows = [('root_motion', None, (0, 0, 0), (0, 0, 0.2)),
         ('pelvis', 'root_motion', (0, 0, 1), (0, 0, 1.2)),
-        ('head', 'pelvis', (0, 0, 1.8), (0, 0, 2))]
+        ('head', 'pelvis', (0, 0, 1.8), (0, 0, 2)),
+        ('Eye_L', 'head', (0.05, -0.05, 1.9), (0.05, -0.1, 1.9)),
+        ('Eye_R', 'head', (-0.05, -0.05, 1.94), (-0.05, -0.1, 1.94))]
 for side, sign in (('L', 1), ('R', -1)):
     rows.extend([
         (f'arm_upper_{side}', 'pelvis', (sign * 0.2, 0, 1.5), (sign * 0.5, 0, 1.5)),
@@ -62,8 +64,8 @@ source.matrix_world = Matrix.Translation((3, 4, 1)) @ Matrix.Rotation(0.3, 4, 'Z
 reference = {}
 for name, parent, head, tail in rows:
     direction = (Vector(tail) - Vector(head)).normalized()
-    reference[name] = Matrix.Translation(Vector(head) * 1.1) @ Vector((1, 0, 0)).rotation_difference(direction).to_matrix().to_4x4()
-native_bones = [SimpleNamespace(name=name, parent=parent) for name, parent, _, _ in rows]
+    reference[name.replace('Eye_', 'eye_0_')] = Matrix.Translation(Vector(head) * 1.1) @ Vector((1, 0, 0)).rotation_difference(direction).to_matrix().to_4x4()
+native_bones = [SimpleNamespace(name=name.replace('Eye_', 'eye_0_'), parent=parent) for name, parent, _, _ in rows]
 points = [(0, 0, 2)]
 for sign in (1, -1):
     points.extend((sign * 0.1 + i * 0.003, -j * 0.025, 0.02) for i in range(4) for j in range(4))
@@ -100,6 +102,12 @@ with patch.object(addon, 'reference_bones', return_value=native_bones), \
     skin = next(o for o in collection.objects if o.type == 'MESH')
     assert rig.deadlock_avatar_scale == 1
     baseline = size.avatar_height(rig)
+    baseline_eyes = size.avatar_eye_height(rig)
+    ground, _ = size.avatar_bounds(rig)
+    expected_eyes = sum((rig.matrix_world @ rig.data.bones[f'Eye_{side}'].head_local).z
+                        for side in ('L', 'R')) / 2 - ground
+    assert abs(baseline_eyes - expected_eyes) < 1e-6
+    assert abs(baseline_eyes - baseline) > 0.1
     baseline_world, skin_world = rig.matrix_world.copy(), skin.matrix_world.copy()
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
@@ -111,6 +119,8 @@ with patch.object(addon, 'reference_bones', return_value=native_bones), \
         rig.deadlock_avatar_scale = value
         assert abs(rig.deadlock_avatar_scale - value) < 1e-6, settings.status
         assert abs(size.avatar_height(rig) - baseline * value) < 1e-5
+        assert abs(size.avatar_eye_height(rig) - baseline_eyes * value) < 1e-5
+        assert rig.data.pose_position == 'POSE'
         assert rig[preview.RESTORE_KEY] == saved_pose
         assert abs(min(json.loads(rig['deadlock_retarget_standing_soles']).values())) < 1e-6
         assert close(skin.matrix_world.inverted() @ rig.matrix_world, skin_world.inverted() @ baseline_world)
@@ -133,6 +143,7 @@ with patch.object(addon, 'reference_bones', return_value=native_bones), \
     hidden.hide_render = True
     bpy.context.view_layer.update()
     assert abs(size.avatar_height(rig) - baseline) < 1e-5
+    assert abs(size.avatar_eye_height(rig) - baseline_eyes) < 1e-5
 
     def block(**kwargs):
         if kwargs.get('block_name') == 'DATA':
@@ -144,27 +155,66 @@ with patch.object(addon, 'reference_bones', return_value=native_bones), \
         index = kwargs['block_id']
         return {'m_sceneObjects': [dict(m_vMinBounds=(0, 0, 0), m_vMaxBounds=(0, 0, 80 if index == 0 else 1000))]}
 
-    resource = SimpleNamespace(get_block=lambda *args, **kwargs: block(**kwargs))
+    resource = SimpleNamespace(get_block=lambda *args, **kwargs: block(**kwargs), get_bones=lambda: native_bones)
     with patch.object(addon, 'archive', return_value=SimpleNamespace(read=lambda path: b'hero')), \
             patch.object(addon, 'read_resource', return_value=resource):
-        target = 80 * addon.UNIT
+        target = sum(reference[f'eye_0_{side}'].translation.z for side in ('L', 'R')) / 2
         assert abs(size.hero_height(settings) - target) < 1e-6
         assert bpy.ops.deadlock.fit_avatar_height() == {'FINISHED'}, settings.status
-        assert abs(size.avatar_height(rig) - target) < 1e-5
+        assert 'eye height' in settings.status
+        assert abs(size.avatar_eye_height(rig) - target) < 1e-5
+        assert abs(rig.deadlock_avatar_scale - target / baseline_eyes) < 1e-5
         first_scale = rig.deadlock_avatar_scale
+        # Taller ears/hair affect the mesh top but never the fitted scale.
+        tall_ears = skin.data.shape_keys.key_blocks['Tall ears']
+        tall_ears.value = 1
+        bpy.context.view_layer.update()
+        assert size.avatar_height(rig) > baseline * first_scale + 0.1
         assert bpy.ops.deadlock.fit_avatar_height() == {'FINISHED'}
         assert abs(rig.deadlock_avatar_scale - first_scale) < 1e-6
+        tall_ears.value = key.value
+        bpy.context.view_layer.update()
 
-    # External meshes use the same body bounds and Source 2 unit conversion.
+        # A single available eye is sufficient; eye-end bones are never centers.
+        mapping = rig['deadlock_retarget_mapping']
+        one_eye = json.loads(mapping)
+        del one_eye['Eye_R']
+        rig['deadlock_retarget_mapping'] = json.dumps(one_eye)
+        ground, _ = size.avatar_bounds(rig)
+        assert abs(size.avatar_eye_height(rig) -
+                   ((rig.matrix_world @ rig.data.bones['Eye_L'].head_local).z - ground)) < 1e-6
+        del one_eye['Eye_L']
+        one_eye['head'] = 'eye_end_L'
+        rig['deadlock_retarget_mapping'] = json.dumps(one_eye)
+        before = rig.matrix_world.copy()
+        try:
+            size.fit_hero_height(rig, settings)
+            raise AssertionError('Missing avatar eyes must reject fitting')
+        except ValueError as error:
+            assert 'no mapped eye bones' in str(error)
+        assert close(rig.matrix_world, before)
+        assert rig.deadlock_avatar_scale == first_scale
+        assert rig.data.pose_position == 'POSE'
+        rig['deadlock_retarget_mapping'] = mapping
+
+        with patch.object(addon, 'bone_matrices', return_value={'eye_end_L': Matrix.Identity(4)}):
+            try:
+                size.fit_hero_height(rig, settings)
+                raise AssertionError('Missing hero eyes must reject fitting')
+            except ValueError as error:
+                assert 'selected hero has no mapped eye bones' in str(error)
+        assert close(rig.matrix_world, before)
+
+    # External mesh ground bounds use Source 2 units; their top is irrelevant.
     model = SimpleNamespace(get_block=lambda *args, **kw: (
         {'m_refMeshes': ['body.vmesh'], 'm_refLODGroupMasks': [1],
          'm_refMeshGroupMasks': [1], 'm_nDefaultMeshGroupMask': 1}
-        if kw.get('block_name') == 'DATA' else {'embedded_meshes': []}))
+        if kw.get('block_name') == 'DATA' else {'embedded_meshes': []}), get_bones=lambda: native_bones)
     external = SimpleNamespace(get_block=lambda *args, **kw: {
-        'm_sceneObjects': [dict(m_vMinBounds=(0, 0, -2), m_vMaxBounds=(0, 0, 78))]})
+        'm_sceneObjects': [dict(m_vMinBounds=(0, 0, -2), m_vMaxBounds=(0, 0, 1000))]})
     with patch.object(addon, 'archive', return_value=SimpleNamespace(read=lambda path: b'hero')), \
             patch.object(addon, 'read_resource', side_effect=lambda blob, path, **kw: model if path.endswith('.vmdl_c') else external):
-        assert abs(size.hero_height(settings) - target) < 1e-6
+        assert abs(size.hero_height(settings) - (target + 2 * addon.UNIT)) < 1e-6
 
     # Failed calibration rolls back the full placement, cached contacts and value.
     world_before, skin_before = rig.matrix_world.copy(), skin.matrix_world.copy()
@@ -218,4 +268,4 @@ with patch.object(addon, 'reference_bones', return_value=native_bones), \
         assert close(restored.matrix_world, rig.matrix_world)
 
 addon.unregister()
-print('PASS: absolute uniform size, shape-key height, grounding, rollback, idle restore and runtime export')
+print('PASS: uniform size, eye-height fit ignoring tall ears, missing-eye errors, grounding, rollback, idle restore and runtime export')

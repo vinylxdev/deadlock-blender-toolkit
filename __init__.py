@@ -589,7 +589,7 @@ class DL_OT_preserve_retarget_proportions(bpy.types.Operator):
 class DL_OT_fit_avatar_height(bpy.types.Operator):
     bl_idname = 'deadlock.fit_avatar_height'
     bl_label = 'Fit Height to Hero'
-    bl_description = 'Uniformly scale the entire preview to the base hero body height, measured in rest pose with current shape keys and modifiers'
+    bl_description = 'Uniformly scale the entire preview to match the base hero ground-to-eye height using rest eye bones, ignoring hats and hair above the eyes'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -605,7 +605,7 @@ class DL_OT_fit_avatar_height(bpy.types.Operator):
             from .physics import physics_rig
             from .retarget_size import fit_hero_height
             height = fit_hero_height(physics_rig(context, settings), settings)
-            settings.status = f'Avatar fitted to the base hero height ({height:.3f} m); Build Retargeted VPK to export.'
+            settings.status = f'Avatar fitted to the base hero eye height ({height:.3f} m); Build Retargeted VPK to export.'
             return {'FINISHED'}
         except Exception as error:
             return report_error(self, settings, error)
