@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Deadlock Blender Toolkit",
     "author": "Vinyl",
-    "version": (0, 3, 36),
+    "version": (0, 3, 38),
     "blender": (5, 2, 0),
     "location": "3D View > Sidebar > Deadlock Toolkit",
     "description": "Choose a hero, inspect its rig, export FBX, compile and package a prepared replacement",

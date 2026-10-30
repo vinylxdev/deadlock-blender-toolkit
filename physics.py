@@ -211,6 +211,54 @@ def export_chains(rig, names):
     return result
 
 
+def compiler_chain_paths(node):
+    """Build linear reconstruction paths without duplicating moving joints.
+
+    ClothChain's orientation builder uses the next listed section, even when
+    joint_parent puts it on a sibling branch. Repeating fixed ancestors in
+    separate paths preserves moving springs without borrowing a sibling frame.
+    """
+    rows = node.get('chain', {}).get('joints', [])
+    if '_swing_only' in node or not rows:
+        return [node]
+    by_name = {row['joint_name']: row for row in rows}
+    children = {name: [] for name in by_name}
+    for row in rows:
+        parent = row.get('joint_parent')
+        if parent in children:
+            children[parent].append(row['joint_name'])
+    # The compiler also adds links between sibling sections. They are redundant
+    # only when every child of a fork is fixed; keep moving forks unchanged.
+    if any(len(branches) > 1 and any(by_name[child].get('simulate', True) or
+                                    by_name[child].get('allow_rotation', True)
+                                    for child in branches)
+           for branches in children.values()):
+        return [node]
+    paths = []
+    pending = [(node['root_bone'], [])]
+    while pending:
+        name, ancestors = pending.pop()
+        path = ancestors + [by_name[name]]
+        if children[name]:
+            pending.extend((child, path) for child in reversed(children[name]))
+        else:
+            paths.append(path)
+    if len(paths) == 1:
+        return [node]
+    counts = {}
+    for path in paths:
+        for row in path:
+            name = row['joint_name']
+            counts[name] = counts.get(name, 0) + 1
+    if any(count > 1 and (by_name[name].get('simulate', True) or
+                         by_name[name].get('allow_rotation', True))
+           for name, count in counts.items()):
+        return [node]
+    return [dict(node, name=node['name'] + f'_path_{index:03d}',
+                 chain=dict(node['chain'], joints=path, selection=[]))
+            for index, path in enumerate(paths)]
+
+
 def append_physics_modeldoc(document, nodes, colliders=()):
     if not nodes:
         return document
@@ -251,7 +299,7 @@ def append_physics_modeldoc(document, nodes, colliders=()):
             cloth.extend(node['_swing_only']['cloth'])
             jiggles.extend(node['_swing_only']['jigglebones'])
         else:
-            cloth.append(node)
+            cloth.extend(compiler_chain_paths(node))
     params = {'_class': 'ClothParams', 'new_style': True, 'unitless_damping': True,
               'default_gravity_scale': 1.0, 'default_vel_air_drag': 0.1, 'extra_iterations': 2}
     document = append_list(document, 'Softbody', cloth, [params])
@@ -293,6 +341,86 @@ def validate_compiled_limits(fe, rows, unit):
     return checked
 
 
+def validate_compiled_chain_bindings(fe, nodes):
+    """Reject bone reconstruction inputs outside their configured chain.
+
+    Sibling strands under one configured root may share supports. Animation
+    parenting is separate: only compiled cloth reconstruction is checked here.
+    Native hero controls are left alone.
+    """
+    owners, path_members = {}, {}
+    path_count = 0
+    for node in nodes:
+        root = node['root_bone']
+        members = [row['joint_name'] for row in node['chain']['joints']]
+        members.extend(row['name'] for row in node.get('_swing_only', {}).get('helpers', []))
+        for name in members:
+            if name in owners and owners[name] != root:
+                raise ValueError('Physics chains overlap at ' + name)
+            owners[name] = root
+        paths = compiler_chain_paths(node)
+        if len(paths) > 1:
+            path_count += len(paths)
+            for path in paths:
+                members = {row['joint_name'] for row in path['chain']['joints']}
+                for row in path['chain']['joints']:
+                    if row['simulate'] or row['allow_rotation']:
+                        path_members[row['joint_name']] = members
+
+    names = [str(name) for name in fe['m_CtrlName']]
+    control_owners, control_bones = [], []
+    for name in names:
+        bone = name
+        owner = owners.get(name)
+        if owner is None and name.startswith('$cc'):
+            bone, separator, suffix = name[3:].rpartition('_')
+            if separator and suffix.isdecimal():
+                owner = owners.get(bone)
+        control_owners.append(owner)
+        control_bones.append(bone)
+
+    def check(source, targets, kind):
+        source = int(source)
+        if not 0 <= source < len(names):
+            raise ValueError(f'Invalid physics {kind} control index: {source}')
+        owner = control_owners[source]
+        if owner is None:
+            return False
+        for target in targets:
+            target = int(target)
+            if not 0 <= target < len(names):
+                raise ValueError(f'Invalid physics {kind} input for {names[source]}: {target}')
+            if control_owners[target] != owner:
+                target_owner = control_owners[target] or 'outside configured physics chains'
+                raise ValueError(
+                    f'Physics {kind} crosses configured chain boundary: '
+                    f'{names[source]} (chain {owner}) uses {names[target]} (chain {target_owner})')
+            members = path_members.get(control_bones[source])
+            if members is not None and control_bones[target] not in members:
+                raise ValueError(
+                    f'Physics {kind} leaves its compiled reconstruction path: '
+                    f'{names[source]} uses sibling support {names[target]} in chain {owner}')
+        return True
+
+    axes = ('nNodeX0', 'nNodeX1', 'nNodeY0', 'nNodeY1')
+    rotations = set()
+    for row in fe.get('m_NodeBases', []):
+        if check(row['nNode'], [row[key] for key in axes], 'rotation binding'):
+            rotations.add(int(row['nNode']))
+    # SIMD records may repeat scalar controls and pad their last packet. Check
+    # every lane even when the scalar copy has already passed.
+    for row in fe.get('m_SimdNodeBases', []):
+        for lane, source in enumerate(row['nNode']):
+            if check(source, [row[key][lane] for key in axes], 'rotation binding'):
+                rotations.add(int(source))
+    offsets = 0
+    for row in fe.get('m_ReverseOffsets', []):
+        offsets += check(row['nBoneCtrl'], [row['nTargetNode']], 'position binding')
+    return {'verified': True, 'configured_chains': len(nodes),
+            'rotation_controls_checked': len(rotations), 'position_offsets_checked': offsets,
+            'reconstruction_paths_checked': path_count}
+
+
 def validate_compiled_physics(compiled, path, nodes, colliders=()):
     """Require real compiled dynamic nodes and correct skeleton bindings."""
     if not nodes:
@@ -304,6 +432,7 @@ def validate_compiled_physics(compiled, path, nodes, colliders=()):
     fe = phys.get('m_pFeModel') if phys else None
     if not fe or (int(fe['m_nNodeCount']) <= int(fe['m_nStaticNodes']) and not fe.get('m_JiggleBones')):
         raise ValueError('Compiler did not produce dynamic physics nodes')
+    chain_boundaries = validate_compiled_chain_bindings(fe, nodes)
     names = [str(n) for n in fe['m_CtrlName']]
     static = int(fe['m_nStaticNodes'])
     skeleton = {bone.name for bone in resource.get_bones()}
@@ -364,5 +493,6 @@ def validate_compiled_physics(compiled, path, nodes, colliders=()):
         collision = validate_colliders(fe, colliders, [row for node in nodes for row in node['chain']['joints']], UNIT)
     return {'enabled': True, 'chains': checked, 'compiled_nodes': int(fe['m_nNodeCount']),
             'static_nodes': static, 'runtime_simulation_verified': False,
+            'chain_boundaries': chain_boundaries,
             'max_physics_rest_position_error_meters': maximum_rest_error,
             'collision': collision}

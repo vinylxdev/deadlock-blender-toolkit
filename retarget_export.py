@@ -87,12 +87,18 @@ def prepare_retarget_export(settings):
     constraints = []
     for bone in source.data.bones:
         name, parent = bone.name, parents[bone.name]
+        role = mapping.get(name)
+        if not role:
+            # Bind accessories to their animated ancestor directly. Chaining
+            # runtime constraints through other accessory bones can read a
+            # different pose in game, even with accessory physics disabled.
+            while parent is not None and not mapping.get(parent):
+                parent = parents[parent]
         # Only the driving frame changes. The authored bind hierarchy stays
         # intact so the imported mesh and its inverse bind poses are preserved.
         parent_rest = rest[parent] if parent else runtime_root
         local = parent_rest.inverted() @ rest[name]
         parent_name = names[parent] if parent else root
-        role = mapping.get(name)
         position_target=parent_name
         position_offset=local.translation
         if role=='pelvis':
